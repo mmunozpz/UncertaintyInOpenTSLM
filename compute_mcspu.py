@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2025 Stanford University, ETH Zurich, and the project authors (see CONTRIBUTORS.md)
+# SPDX-FileCopyrightText: 2025 This source file is part of the OpenTSLM open-source project.
+#
+# SPDX-License-Identifier: MIT
+
+"""
+Compute Monte Carlo Signal Perturbation Uncertainty (MCSPU) scores.
+
+Runs N+1 forward passes per test sample (1 clean + N with additive Gaussian
+noise) and reports U_signal = mean KL( p_clean || p_noisy ).
+
+Usage:
+    python compute_mcspu.py \\
+        --checkpoint results/Llama3_2_1B/OpenTSLMFlamingo/stage3_cot/checkpoints/best_model.pt \\
+        --model_type flamingo \\
+        --dataset har \\
+        --n_samples 50 \\
+        --sigma 1.0 \\
+        --device cuda \\
+        --output mcspu_har.jsonl
+"""
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src", "open_flamingo"))
+
+import numpy as np
+import torch
+
+
+# ---------------------------------------------------------------------------
+# Answer vocabulary defaults
+# ---------------------------------------------------------------------------
+
+HAR_LABELS = [
+    "biking", "lying", "running", "sitting", "standing",
+    "walking", "walking_down", "walking_up",
+]
+TSQA_LABELS = ["A", "B", "C", "D"]
+
+
+def _resolve_answer_vocab(dataset_name: str, answer_vocab_arg: str | None) -> list[str] | None:
+    """Return the default answer vocab for *dataset_name*, or None for ECG QA (per-sample)."""
+    if answer_vocab_arg:
+        return [v.strip() for v in answer_vocab_arg.split(",")]
+
+    if dataset_name == "har":
+        return HAR_LABELS
+    if dataset_name == "tsqa":
+        return TSQA_LABELS
+    if dataset_name == "sleep":
+        from opentslm.time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
+        return SleepEDFCoTQADataset.get_labels()
+    if dataset_name == "ecg_qa":
+        # Per-sample vocab stored in sample["possible_answers"] by ECGQACoTQADataset.
+        return None
+    raise ValueError(f"Unknown dataset: {dataset_name!r}")
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
+def _load_model(args) -> object:
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Loading {args.model_type.upper()} model from {args.checkpoint} on {device} ...")
+
+    if args.model_type == "sp":
+        from opentslm.model.llm.OpenTSLMSP import OpenTSLMSP
+        model = OpenTSLMSP(llm_id=args.llm_id, device=device)
+        model.load_from_file(args.checkpoint)
+    elif args.model_type == "flamingo":
+        from opentslm.model.llm.OpenTSLMFlamingo import OpenTSLMFlamingo
+        model = OpenTSLMFlamingo(llm_id=args.llm_id, device=device)
+        model.load_from_file(args.checkpoint)
+    else:
+        raise ValueError(f"Unknown model_type: {args.model_type!r}. Choose 'sp' or 'flamingo'.")
+
+    model.eval()
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Dataset loading
+# ---------------------------------------------------------------------------
+
+def _load_dataset(args, model):
+    eos = model.get_eos_token()
+    split = args.split
+
+    if args.dataset == "har":
+        from opentslm.time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADataset
+        return HARCoTQADataset(split=split, EOS_TOKEN=eos)
+    if args.dataset == "sleep":
+        from opentslm.time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
+        return SleepEDFCoTQADataset(split=split, EOS_TOKEN=eos)
+    if args.dataset == "ecg_qa":
+        from opentslm.time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADataset
+        return ECGQACoTQADataset(split=split, EOS_TOKEN=eos)
+    if args.dataset == "tsqa":
+        from opentslm.time_series_datasets.TSQADataset import TSQADataset
+        return TSQADataset(split=split, EOS_TOKEN=eos)
+    raise ValueError(f"Unknown dataset: {args.dataset!r}")
+
+
+# ---------------------------------------------------------------------------
+# Summary printing
+# ---------------------------------------------------------------------------
+
+def _print_summary(results: list[dict], args) -> None:
+    scores = [r["mcspu_score"] for r in results]
+    correct = sum(1 for r in results if r.get("clean_pred") == r.get("ground_truth"))
+    n = len(results)
+    accuracy = correct / n if n else float("nan")
+
+    # Correlation between MCSPU score and model uncertainty (1 - max clean prob)
+    confidences = [max(r["clean_probs"]) for r in results]
+    uncertainties = [1.0 - c for c in confidences]
+    try:
+        corr = float(np.corrcoef(scores, uncertainties)[0, 1])
+    except Exception:
+        corr = float("nan")
+
+    print("\n" + "=" * 60)
+    print("MCSPU SUMMARY")
+    print("=" * 60)
+    print(f"  Samples scored:       {n}")
+    print(f"  Dataset:              {args.dataset} ({args.split})")
+    print(f"  Model:                {args.model_type} / {args.llm_id}")
+    print(f"  Noise sigma:          {args.sigma}")
+    print(f"  N noise realizations: {args.n_samples}")
+    print(f"  Mean MCSPU score:     {np.mean(scores):.4f}")
+    print(f"  Std  MCSPU score:     {np.std(scores):.4f}")
+    print(f"  Clean accuracy:       {accuracy:.4f}  ({correct}/{n})")
+    print(f"  Corr(MCSPU, 1-conf):  {corr:.4f}")
+    print("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compute MCSPU scores for an OpenTSLM checkpoint."
+    )
+    parser.add_argument("--checkpoint", required=True, help="Path to .pt checkpoint")
+    parser.add_argument(
+        "--model_type", required=True, choices=["sp", "flamingo"],
+        help="Model architecture"
+    )
+    parser.add_argument(
+        "--llm_id", default="meta-llama/Llama-3.2-1B",
+        help="HuggingFace LLM model ID (default: meta-llama/Llama-3.2-1B)"
+    )
+    parser.add_argument(
+        "--dataset", required=True, choices=["har", "sleep", "ecg_qa", "tsqa"],
+        help="Dataset to evaluate"
+    )
+    parser.add_argument(
+        "--split", default="test", choices=["train", "validation", "test"],
+        help="Dataset split (default: test)"
+    )
+    parser.add_argument(
+        "--answer_vocab",
+        help="Comma-separated answer classes (overrides dataset default)"
+    )
+    parser.add_argument(
+        "--n_samples", type=int, default=50,
+        help="Number of noise realizations N (default: 50)"
+    )
+    parser.add_argument(
+        "--sigma", type=float, default=1.0,
+        help="Additive noise std deviation (default: 1.0)"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for reproducibility (default: 42)"
+    )
+    parser.add_argument(
+        "--max_samples", type=int, default=None,
+        help="Cap on the number of test samples (default: all)"
+    )
+    parser.add_argument(
+        "--output", default="mcspu_results.jsonl",
+        help="Output JSONL file (default: mcspu_results.jsonl)"
+    )
+    parser.add_argument(
+        "--device", default=None,
+        help="Device: cuda | cpu | mps (default: auto-detect)"
+    )
+    args = parser.parse_args()
+
+    model = _load_model(args)
+    dataset = _load_dataset(args, model)
+    answer_vocab = _resolve_answer_vocab(args.dataset, args.answer_vocab)
+
+    if answer_vocab is None and args.dataset != "ecg_qa":
+        parser.error(
+            f"No default answer vocab for dataset {args.dataset!r}. "
+            "Supply --answer_vocab."
+        )
+
+    # MCSpUScorer uses answer_vocab as the default; ECG QA overrides per-sample.
+    from opentslm.uncertainty.mcspu import MCSpUScorer
+    scorer = MCSpUScorer(
+        model=model,
+        answer_vocab=answer_vocab or [],  # ECG QA uses per-sample override
+        n_samples=args.n_samples,
+        sigma=args.sigma,
+        seed=args.seed,
+    )
+
+    print(f"Scoring {args.dataset} {args.split} split "
+          f"(N={args.n_samples}, sigma={args.sigma}) ...")
+
+    results = scorer.score_dataset(dataset, max_samples=args.max_samples)
+
+    # Attach provenance fields to each record
+    for r in results:
+        r["checkpoint"] = args.checkpoint
+        r["dataset"] = args.dataset
+        r["split"] = args.split
+        r["llm_id"] = args.llm_id
+        r["model_type"] = args.model_type
+
+    # Write output
+    with open(args.output, "w") as f:
+        for r in results:
+            f.write(json.dumps(r) + "\n")
+    print(f"\nResults written to {args.output}")
+
+    _print_summary(results, args)
+
+
+if __name__ == "__main__":
+    main()

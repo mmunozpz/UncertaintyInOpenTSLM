@@ -1,0 +1,337 @@
+# ============================================================================
+# NOISE INJECTION INTERPRETABILITY EXPERIMENTS
+# ============================================================================
+# For each curriculum stage, train with Gaussian noise vs real signals,
+# then evaluate with signal contribution tracking to test whether the
+# model actually uses the time series signal content.
+#
+# Three conditions per stage:
+#   1. real_<task>         — real signals, real stats in text
+#   2. noise_<task>        — noise signals, real stats kept in text (can the model cheat via stats?)
+#   3. noise_stripped_<task> — noise signals, stats stripped from text (no shortcut possible)
+#
+# Each stage starts from the checkpoint 1 stage before:
+#   - Stage 1 (TSQA): fresh model (no predecessor needed)
+#   - Stage 3 (HAR-CoT): stage 2 (captioning) checkpoint
+#   - Stage 4 (Sleep-CoT): stage 3 (HAR-CoT) checkpoint
+#   - Stage 5 (ECG-CoT): stage 4 (Sleep-CoT) checkpoint
+#
+# IMPORTANT: Each stage uses its own experiment name to avoid directory collisions.
+# ============================================================================
+
+# ============================================================================
+# PREREQUISITES: Download intermediate HF checkpoints
+# ============================================================================
+# Stage 1 needs no predecessor (trains from scratch).
+#
+# Stage 3 needs the stage 2 (captioning) checkpoint.
+# Stage 4 needs the stage 3 (HAR-CoT) checkpoint.
+#
+# Download them from HuggingFace and place as best_model.pt:
+#
+# python -c "
+# from huggingface_hub import hf_hub_download
+# import shutil, os
+#
+# # Stage 2 captioning checkpoint (predecessor for stage 3 HAR)
+# path = hf_hub_download('OpenTSLM/llama-3.2-1b-m4-flamingo', 'model_checkpoint.pt')
+# dst = 'results/Llama_3_2_1B/OpenTSLMFlamingo/stage2_captioning/checkpoints/best_model.pt'
+# os.makedirs(os.path.dirname(dst), exist_ok=True)
+# shutil.copy(path, dst)
+# print(f'Copied stage 2 checkpoint to {dst}')
+#
+# # Stage 3 HAR-CoT checkpoint (predecessor for stage 4 Sleep)
+# path = hf_hub_download('OpenTSLM/llama-3.2-1b-har-flamingo', 'model_checkpoint.pt')
+# dst = 'results/Llama_3_2_1B/OpenTSLMFlamingo/stage3_cot/checkpoints/best_model.pt'
+# os.makedirs(os.path.dirname(dst), exist_ok=True)
+# shutil.copy(path, dst)
+# print(f'Copied stage 3 checkpoint to {dst}')
+# "
+#
+# You already have stage 4 (sleep) at:
+#   results/Llama_3_2_1B/OpenTSLMFlamingo/stage4_sleep_cot/checkpoints/best_model.pt
+#   (source: OpenTSLM/llama-3.2-1b-sleep-flamingo)
+#
+# For evaluating official HF checkpoints, also download them to hf_checkpoints/:
+#
+# python -c "
+# from huggingface_hub import hf_hub_download
+# import shutil, os
+# os.makedirs('hf_checkpoints', exist_ok=True)
+#
+# # TSQA (stage 1) - already at hf_checkpoints/tsqa_model_checkpoint.pt
+# # path = hf_hub_download('OpenTSLM/llama-3.2-1b-tsqa-flamingo', 'model_checkpoint.pt')
+# # shutil.copy(path, 'hf_checkpoints/tsqa_model_checkpoint.pt')
+#
+# # HAR-CoT (stage 3)
+# path = hf_hub_download('OpenTSLM/llama-3.2-1b-har-flamingo', 'model_checkpoint.pt')
+# shutil.copy(path, 'hf_checkpoints/har_model_checkpoint.pt')
+# print(f'Copied HAR checkpoint to hf_checkpoints/har_model_checkpoint.pt')
+#
+# # Sleep-CoT (stage 4)
+# path = hf_hub_download('OpenTSLM/llama-3.2-1b-sleep-flamingo', 'model_checkpoint.pt')
+# shutil.copy(path, 'hf_checkpoints/sleep_model_checkpoint.pt')
+# print(f'Copied Sleep checkpoint to hf_checkpoints/sleep_model_checkpoint.pt')
+# "
+# ============================================================================
+
+# ============================================================================
+# STAGE 1: TSQA (Time Series QA - MCQ format)
+# ============================================================================
+# No predecessor needed - trains from scratch.
+
+# Train with Gaussian noise (stats kept in text)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=0,1 torchrun --master_port=10070 --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage1_mcq \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --noise_type gaussian \
+    --noise_seed 67 \
+    --experiment_name noise_tsqa \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# Train with Gaussian noise + strip stats from text
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=0,1 torchrun --master_port=10076 --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage1_mcq \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --noise_type gaussian \
+    --noise_seed 67 \
+    --strip_stats \
+    --experiment_name noise_stripped_tsqa \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# Train with real signals (control)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=2,3 torchrun --master_port=10071 --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage1_mcq \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --experiment_name real_tsqa \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# Evaluate TSQA - Real signal
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=0 python evaluation/opentslm/tsqa/evaluate_tsqa_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_real_tsqa/stage1_mcq/checkpoints/best_model.pt \
+    --output results/eval_tsqa_real.json
+
+# Evaluate TSQA - Noise (stats kept)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=1 python evaluation/opentslm/tsqa/evaluate_tsqa_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_noise_tsqa/stage1_mcq/checkpoints/best_model.pt \
+    --use_noise \
+    --output results/eval_tsqa_noise.json
+
+# Evaluate TSQA - Noise (stats stripped)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=4 python evaluation/opentslm/tsqa/evaluate_tsqa_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_noise_stripped_tsqa/stage1_mcq/checkpoints/best_model.pt \
+    --use_noise \
+    --strip_stats \
+    --output results/eval_tsqa_noise_stripped.json
+
+# Evaluate TSQA - Official HF checkpoint
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=0 python evaluation/opentslm/tsqa/evaluate_tsqa_flamingo.py \
+    --checkpoint hf_checkpoints/tsqa_model_checkpoint.pt \
+    --output results/eval_tsqa_official.json
+
+# ============================================================================
+# STAGE 3: HAR-CoT (Human Activity Recognition - 3-axis accelerometer)
+# ============================================================================
+# Requires: stage2_captioning checkpoint in results/Llama_3_2_1B/OpenTSLMFlamingo/
+#           (download from OpenTSLM/llama-3.2-1b-m4-flamingo, see PREREQUISITES above)
+
+# Train with Gaussian noise (stats kept)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=4,5 torchrun --master_port=10072 --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage3_cot \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --noise_type gaussian \
+    --noise_seed 67 \
+    --experiment_name noise_har \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# Train with Gaussian noise + strip stats
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6,7 torchrun --master_port=10077 --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage3_cot \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --noise_type gaussian \
+    --noise_seed 67 \
+    --strip_stats \
+    --experiment_name noise_stripped_har \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# Train with real signals (control)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6,7 torchrun --master_port=10073 --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage3_cot \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --experiment_name real_har \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# Evaluate HAR - Real signal
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6 python evaluation/opentslm/har_cot/evaluate_har_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_real_har/stage3_cot/checkpoints/best_model.pt \
+    --output results/eval_har_real.json
+
+# Evaluate HAR - Noise (stats kept)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6 python evaluation/opentslm/har_cot/evaluate_har_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_noise_har/stage3_cot/checkpoints/best_model.pt \
+    --use_noise \
+    --output results/eval_har_noise.json
+
+# Evaluate HAR - Noise (stats stripped)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=7 python evaluation/opentslm/har_cot/evaluate_har_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_noise_stripped_har/stage3_cot/checkpoints/best_model.pt \
+    --use_noise \
+    --strip_stats \
+    --output results/eval_har_noise_stripped.json
+
+# Evaluate HAR - Official HF checkpoint
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=7 python evaluation/opentslm/har_cot/evaluate_har_flamingo.py \
+    --checkpoint hf_checkpoints/har_model_checkpoint.pt \
+    --output results/eval_har_official.json
+
+# ============================================================================
+# STAGE 4: Sleep-CoT (Sleep Stage Classification - EEG)
+# ============================================================================
+# Requires: stage3_cot checkpoint in results/Llama_3_2_1B/OpenTSLMFlamingo/
+#           (download from OpenTSLM/llama-3.2-1b-har-flamingo, see PREREQUISITES above)
+
+# Train with Gaussian noise (stats kept)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6,7 torchrun --master_port=10074 --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage4_sleep_cot \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --noise_type gaussian \
+    --noise_seed 67 \
+    --experiment_name noise_sleep \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# Train with Gaussian noise + strip stats
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6,7 torchrun --master_port=10078 --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage4_sleep_cot \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --noise_type gaussian \
+    --noise_seed 67 \
+    --strip_stats \
+    --experiment_name noise_stripped_sleep \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# Train with real signals (control)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6,7 torchrun --master_port=10075 --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage4_sleep_cot \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --experiment_name real_sleep \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# Evaluate Sleep - Real signal
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6 python evaluation/opentslm/sleep/evaluate_sleep_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_real_sleep/stage4_sleep_cot/checkpoints/best_model.pt \
+    --output results/eval_sleep_real.json
+
+# Evaluate Sleep - Noise (stats kept)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6 python evaluation/opentslm/sleep/evaluate_sleep_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_noise_sleep/stage4_sleep_cot/checkpoints/best_model.pt \
+    --use_noise \
+    --output results/eval_sleep_noise.json
+
+# Evaluate Sleep - Noise (stats stripped)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=7 python evaluation/opentslm/sleep/evaluate_sleep_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_noise_stripped_sleep/stage4_sleep_cot/checkpoints/best_model.pt \
+    --use_noise \
+    --strip_stats \
+    --output results/eval_sleep_noise_stripped.json
+
+# Evaluate Sleep - Official HF checkpoint
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=7 python evaluation/opentslm/sleep/evaluate_sleep_flamingo.py \
+    --checkpoint hf_checkpoints/sleep_model_checkpoint.pt \
+    --output results/eval_sleep_official.json
+
+# ============================================================================
+# STAGE 5: ECG-CoT (ECG Question Answering - 12-lead ECG)
+# ============================================================================
+# Requires: stage4_sleep_cot checkpoint in results/Llama_3_2_1B/OpenTSLMFlamingo/
+#           (download from OpenTSLM/llama-3.2-1b-sleep-flamingo, see PREREQUISITES above)
+
+# Train with Gaussian noise (stats kept)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=4,5 torchrun --master_port=10080 --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage5_ecg_cot \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --noise_type gaussian \
+    --noise_seed 67 \
+    --experiment_name noise_ecg \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# Train with Gaussian noise + strip stats
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6,7 torchrun --master_port=10081 --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage5_ecg_cot \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --noise_type gaussian \
+    --noise_seed 67 \
+    --strip_stats \
+    --experiment_name noise_stripped_ecg \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# Train with real signals (control)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6,7 torchrun --master_port=10082 --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage5_ecg_cot \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --experiment_name real_ecg \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# Evaluate ECG - Real signal
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_real_ecg/stage5_ecg_cot/checkpoints/best_model.pt \
+    --output results/eval_ecg_real.json
+
+# Evaluate ECG - Noise (stats kept)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_noise_ecg/stage5_ecg_cot/checkpoints/best_model.pt \
+    --use_noise \
+    --output results/eval_ecg_noise.json
+
+# Evaluate ECG - Noise (stats stripped)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=7 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_noise_stripped_ecg/stage5_ecg_cot/checkpoints/best_model.pt \
+    --use_noise \
+    --strip_stats \
+    --output results/eval_ecg_noise_stripped.json
+
+# Evaluate ECG - Official HF checkpoint
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=7 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
+    --checkpoint hf_checkpoints/model_checkpoint.pt \
+    --output results/eval_ecg_official.json
+
+# ============================================================================
+# EXPECTED RESULTS LOCATIONS
+# ============================================================================
+# Each stage has 3 conditions (real / noise / noise_stripped):
+#
+#   Stage 1 (TSQA):  real_tsqa / noise_tsqa / noise_stripped_tsqa
+#   Stage 3 (HAR):   real_har  / noise_har  / noise_stripped_har
+#   Stage 4 (Sleep): real_sleep / noise_sleep / noise_stripped_sleep
+#   Stage 5 (ECG):   real_ecg / noise_ecg / noise_stripped_ecg
+#
+# Training output per experiment:
+#   results/Llama_3_2_1B/OpenTSLMFlamingo_<experiment_name>/<stage>/checkpoints/best_model.pt
+#
+# Evaluation JSON files:
+#   results/eval_<task>_real.json
+#   results/eval_<task>_noise.json
+#   results/eval_<task>_noise_stripped.json

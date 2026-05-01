@@ -3,9 +3,12 @@
 #
 # SPDX-License-Identifier: MIT
 
+import copy
+
 import torch
 import torch.nn as nn
-from typing import List, Dict, Tuple, Optional
+import torch.nn.functional as F
+from typing import Any, List, Dict, Tuple, Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.nn.utils.rnn import pad_sequence
 
@@ -362,6 +365,77 @@ class OpenTSLMSP(TimeSeriesLLM):
         )
         return outputs.loss
 
+    def compute_class_logprobs(
+        self,
+        sample: Dict[str, Any],
+        answer_vocab: List[str],
+    ) -> torch.Tensor:
+        """
+        Teacher-forced scoring for every candidate in *answer_vocab*.
+
+        Encodes the prompt (time series + text) exactly once, then appends
+        each candidate answer's embeddings to form B sequences (B = len(answer_vocab)).
+        A single batched forward pass gives the vocabulary logits; we gather
+        the log-prob of each candidate's actual tokens and sum to get
+        log P(answer | prompt) per candidate.
+
+        Returns a 1-D CPU float32 tensor of shape (B,).
+        """
+        B = len(answer_vocab)
+        device = self.device
+
+        # 1. Encode the prompt once (batch of 1).
+        with torch.no_grad():
+            embeds_1, mask_1 = self.pad_and_apply_batch([copy.deepcopy(sample)])
+        L = embeds_1.shape[1]  # prompt length (no padding for batch-of-1)
+
+        # 2. Tile prompt embeddings to batch size B.
+        inputs_embeds = embeds_1.expand(B, -1, -1)   # [B, L, H]
+        attention_mask = mask_1.expand(B, -1)         # [B, L]
+
+        # 3. Tokenize all answer candidates.
+        #    add_special_tokens=False avoids prepending BOS into the answer.
+        ans_tok = self.tokenizer(
+            answer_vocab,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            add_special_tokens=False,
+        )
+        ans_ids = ans_tok.input_ids.to(device)    # [B, A_max]
+        ans_mask = ans_tok.attention_mask.to(device)  # [B, A_max]
+        A_max = ans_ids.shape[1]
+
+        # 4. Embed answers and concatenate after prompt.
+        with torch.no_grad():
+            ans_emb = self.llm.get_input_embeddings()(ans_ids)  # [B, A_max, H]
+        full_embeds = torch.cat([inputs_embeds, ans_emb], dim=1)  # [B, L+A_max, H]
+        full_mask = torch.cat([attention_mask, ans_mask], dim=1)  # [B, L+A_max]
+
+        # 5. Single forward pass (no labels → just logits).
+        with torch.no_grad():
+            outputs = self.llm(
+                inputs_embeds=full_embeds,
+                attention_mask=full_mask,
+                return_dict=True,
+            )
+        logits = outputs.logits  # [B, L+A_max, vocab_size]
+
+        # 6. Shift-by-1: logits[:, L-1+t, :] predicts the t-th answer token.
+        #    Slice out exactly A_max positions.
+        answer_logits = logits[:, L - 1 : L - 1 + A_max, :]  # [B, A_max, V]
+        log_probs = F.log_softmax(answer_logits.float(), dim=-1)  # [B, A_max, V]
+
+        # 7. Gather log-prob for each candidate's actual tokens, then mask padding.
+        gathered = log_probs.gather(
+            dim=-1,
+            index=ans_ids.clamp(min=0).unsqueeze(-1),  # [B, A_max, 1]
+        ).squeeze(-1)  # [B, A_max]
+        gathered = gathered * ans_mask.float()          # zero out padding positions
+        seq_logprobs = gathered.sum(dim=-1)             # [B]
+
+        return seq_logprobs.cpu()
+
     def get_eos_token(self) -> str:
         return self.tokenizer.eos_token
 
@@ -380,6 +454,20 @@ class OpenTSLMSP(TimeSeriesLLM):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.encoder.load_state_dict(ckpt["encoder_state"])
         self.projector.load_state_dict(ckpt["projector_state"])
+
+        # Auto-enable LoRA when the checkpoint requires it
+        if ckpt.get("lora_enabled", False) and not self.lora_enabled:
+            lora_cfg = ckpt.get("lora_config", {})
+            if lora_cfg:
+                cfg = next(iter(lora_cfg.values()))
+                self.enable_lora(
+                    lora_r=cfg.r,
+                    lora_alpha=cfg.lora_alpha,
+                    lora_dropout=cfg.lora_dropout,
+                    target_modules=list(cfg.target_modules),
+                )
+            else:
+                self.enable_lora()
 
         # Load LoRA state if present (allow missing for backward compatibility)
         self.load_lora_state_from_checkpoint(ckpt, allow_missing=True)

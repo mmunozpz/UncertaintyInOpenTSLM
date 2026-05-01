@@ -10,6 +10,7 @@ mods = [
     "opentslm.model.llm.OpenTSLM",
     "opentslm.model.llm.OpenTSLMFlamingo",
     "opentslm.prompt.full_prompt",
+    "opentslm.uncertainty.mcspu",
 ]
 
 [importlib.import_module(m) for m in mods]

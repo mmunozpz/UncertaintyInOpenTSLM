@@ -2,24 +2,3 @@
 # SPDX-FileCopyrightText: 2025 This source file is part of the OpenTSLM open-source project.
 #
 # SPDX-License-Identifier: MIT
-
-.venv
-.venv_linux
-.vscode
-__pycache__
-.DS_STORE
-
-raw_data
-
-**/data/*
-!**/data/.gitkeep
-
-*.ts
-*.zip
-upload_to_huggingface.py
-
-dist/
-
-*.license
-
-models/

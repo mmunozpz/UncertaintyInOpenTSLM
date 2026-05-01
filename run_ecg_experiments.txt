@@ -1,0 +1,58 @@
+# ============================================================================
+# Gaussian Noise Baseline (Tests if model uses ECG signal content)
+# ============================================================================
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=4,5 torchrun --master_port=10067 --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage5_ecg_cot \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --noise_type gaussian \
+    --noise_seed 67 \
+    --experiment_name noise_gaussian \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# ============================================================================
+# Real ECG Control (Should perform better if model uses signals)
+# ============================================================================
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage5_ecg_cot \
+    --llm_id meta-llama/Llama-3.2-1B \
+    --experiment_name real_ecg \
+    --gradient_checkpointing \
+    --batch_size 2
+
+# ============================================================================
+# EXPECTED RESULTS LOCATIONS
+# ============================================================================
+# results/Llama_3_2_1B/OpenTSLMFlamingo_noise_gaussian/stage5_ecg_cot/
+# results/Llama_3_2_1B/OpenTSLMFlamingo_real_ecg/stage5_ecg_cot/
+#
+# Each contains:
+#   - checkpoints/best_model.pt
+#   - checkpoints/loss_history.txt
+#   - results/test_predictions.jsonl
+#   - results/metrics.json
+
+# ============================================================================
+# EVALUATION WITH SIGNAL CONTRIBUTION TRACKING
+# ============================================================================
+
+# Evaluate HuggingFace Official checkpoint (Stage 5 from OpenTSLM release)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=2 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
+    --checkpoint hf_checkpoints/model_checkpoint.pt \
+    --max_samples 5000 \
+    --output results/eval_hf_official.json
+
+# Evaluate our Stage 5 Real ECG checkpoint
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=3 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_real_ecg/stage5_ecg_cot/checkpoints/best_model.pt \
+    --max_samples 5000 \
+    --output results/eval_real_ecg.json
+
+# Evaluate our Stage 5 Noise checkpoint (with --use_noise to match training)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=7 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_noise_gaussian/stage5_ecg_cot/checkpoints/best_model.pt \
+    --use_noise \
+    --max_samples 5000 \
+    --output results/eval_noise.json

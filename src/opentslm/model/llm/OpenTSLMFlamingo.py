@@ -3,7 +3,10 @@
 #
 # SPDX-License-Identifier: MIT
 
-from types import SimpleNamespace
+from open_flamingo.src.flamingo_lm import FlamingoLayer
+import copy
+from collections import defaultdict
+import numpy as np
 from opentslm.model.encoder.CNNTokenizer import CNNTokenizer
 from opentslm.model.llm.TimeSeriesFlamingoWithTrainableEncoder import (
     TimeSeriesFlamingoWithTrainableEncoder,
@@ -12,7 +15,8 @@ from open_flamingo.src.flamingo_lm import FlamingoLMMixin
 from open_flamingo.src.utils import extend_instance
 import torch
 import torch._dynamo
-from typing import List, Dict, Tuple
+import torch.nn.functional as F
+from typing import Any, List, Dict, Tuple, Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from opentslm.model_config import ENCODER_OUTPUT_DIM
@@ -22,8 +26,179 @@ from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
 
+
+class SignalContributionTracker:
+    """
+    Tracks signal contribution metrics during model forward passes.
+
+    Measures:
+    - residual_stream: |x| magnitude of input to cross-attention blocks
+    - total_contribution: |x_new - x| total contribution from block (attn + ff)
+    - ecg_signal_contribution: |raw_attn * tanh(attn_gate)| - the TRUE ECG signal contribution
+    - ff_contribution: |raw_ff * tanh(ff_gate)| - feedforward contribution (not signal-related)
+    """
+
+    def __init__(self):
+        self.measurements = defaultdict(list)
+        self.hooks = []
+        self._enabled = False
+        self._pending_raw_attn = {}
+        self._pending_raw_ff = {}
+
+    def _make_attn_hook(self, layer_idx: int):
+        """Hook for the inner attention module to capture raw output BEFORE gating."""
+        def hook(module, inputs, output):
+            if not self._enabled:
+                return
+            with torch.no_grad():
+                self._pending_raw_attn[layer_idx] = output.norm(
+                    dim=-1).mean().item()
+        return hook
+
+    def _make_ff_hook(self, layer_idx: int):
+        """Hook for the inner feedforward module to capture raw output BEFORE gating."""
+        def hook(module, inputs, output):
+            if not self._enabled:
+                return
+            with torch.no_grad():
+                self._pending_raw_ff[layer_idx] = output.norm(
+                    dim=-1).mean().item()
+        return hook
+
+    def _make_block_hook(self, layer_idx: int, layer):
+        """Create a forward hook for the outer GatedCrossAttentionBlock."""
+        def hook(module, inputs, output):
+            if not self._enabled:
+                return
+
+            x = inputs[0]
+            x_new = output
+
+            with torch.no_grad():
+                x_magnitude = x.norm(dim=-1).mean().item()
+                total_contribution = (x_new - x).norm(dim=-1).mean().item()
+
+                attn_gate_tanh = torch.tanh(layer.attn_gate).item()
+                ff_gate_tanh = torch.tanh(layer.ff_gate).item()
+
+                raw_attn = self._pending_raw_attn.get(layer_idx, 0.0)
+                raw_ff = self._pending_raw_ff.get(layer_idx, 0.0)
+
+                ecg_contribution = raw_attn * abs(attn_gate_tanh)
+                ff_contribution = raw_ff * abs(ff_gate_tanh)
+
+                if x_magnitude > 1e-8:
+                    total_pct = (total_contribution / x_magnitude) * 100
+                    ecg_pct = (ecg_contribution / x_magnitude) * 100
+                    ff_pct = (ff_contribution / x_magnitude) * 100
+                else:
+                    total_pct = ecg_pct = ff_pct = 0.0
+
+                self.measurements[f'layer_{layer_idx}'].append({
+                    'residual_stream': x_magnitude,
+                    'total_contribution': total_contribution,
+                    'total_contribution_pct': total_pct,
+                    'raw_attn_output': raw_attn,
+                    'attn_gate_tanh': attn_gate_tanh,
+                    'ecg_signal_contribution': ecg_contribution,
+                    'ecg_signal_contribution_pct': ecg_pct,
+                    'raw_ff_output': raw_ff,
+                    'ff_gate_tanh': ff_gate_tanh,
+                    'ff_contribution': ff_contribution,
+                    'ff_contribution_pct': ff_pct,
+                })
+
+                self._pending_raw_attn.pop(layer_idx, None)
+                self._pending_raw_ff.pop(layer_idx, None)
+
+        return hook
+
+    def register_hooks(self, model):
+        """Register hooks on all gated cross-attention blocks and their inner modules."""
+        self.remove_hooks()
+
+        lang_encoder = model.lang_encoder
+
+        if hasattr(lang_encoder, 'gated_cross_attn_layers'):
+            for idx, layer in enumerate(lang_encoder.gated_cross_attn_layers):
+                if layer is not None:
+                    h1 = layer.attn.register_forward_hook(
+                        self._make_attn_hook(idx))
+                    self.hooks.append(h1)
+                    h2 = layer.ff.register_forward_hook(
+                        self._make_ff_hook(idx))
+                    self.hooks.append(h2)
+                    h3 = layer.register_forward_hook(
+                        self._make_block_hook(idx, layer))
+                    self.hooks.append(h3)
+
+            n_layers = len(
+                [l for l in lang_encoder.gated_cross_attn_layers if l is not None])
+            print(
+                f"[SignalContributionTracker] Registered hooks on {n_layers} layers ({len(self.hooks)} total hooks)")
+        else:
+            print(
+                "[SignalContributionTracker] Warning: Could not find gated_cross_attn_layers")
+
+    def remove_hooks(self):
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
+
+    def enable(self):
+        self._enabled = True
+
+    def disable(self):
+        self._enabled = False
+
+    def clear(self):
+        self.measurements.clear()
+
+    def get_summary(self) -> Dict:
+        if not self.measurements:
+            return {'error': 'No measurements collected'}
+
+        summary = {}
+
+        for layer_name, measurements in self.measurements.items():
+            summary[layer_name] = {
+                'residual_stream_mean': float(np.mean([m['residual_stream'] for m in measurements])),
+                'total_contribution_mean': float(np.mean([m['total_contribution'] for m in measurements])),
+                'total_contribution_pct_mean': float(np.mean([m['total_contribution_pct'] for m in measurements])),
+                'raw_attn_output_mean': float(np.mean([m['raw_attn_output'] for m in measurements])),
+                'attn_gate_tanh_mean': float(np.mean([m['attn_gate_tanh'] for m in measurements])),
+                'ecg_signal_contribution_mean': float(np.mean([m['ecg_signal_contribution'] for m in measurements])),
+                'ecg_signal_contribution_pct_mean': float(np.mean([m['ecg_signal_contribution_pct'] for m in measurements])),
+                'raw_ff_output_mean': float(np.mean([m['raw_ff_output'] for m in measurements])),
+                'ff_gate_tanh_mean': float(np.mean([m['ff_gate_tanh'] for m in measurements])),
+                'ff_contribution_mean': float(np.mean([m['ff_contribution'] for m in measurements])),
+                'ff_contribution_pct_mean': float(np.mean([m['ff_contribution_pct'] for m in measurements])),
+                'n_samples': len(measurements)
+            }
+
+        all_measurements = []
+        for measurements in self.measurements.values():
+            all_measurements.extend(measurements)
+
+        summary['overall'] = {
+            'residual_stream_mean': float(np.mean([m['residual_stream'] for m in all_measurements])),
+            'total_contribution_mean': float(np.mean([m['total_contribution'] for m in all_measurements])),
+            'total_contribution_pct_mean': float(np.mean([m['total_contribution_pct'] for m in all_measurements])),
+            'raw_attn_output_mean': float(np.mean([m['raw_attn_output'] for m in all_measurements])),
+            'attn_gate_tanh_mean': float(np.mean([m['attn_gate_tanh'] for m in all_measurements])),
+            'ecg_signal_contribution_mean': float(np.mean([m['ecg_signal_contribution'] for m in all_measurements])),
+            'ecg_signal_contribution_pct_mean': float(np.mean([m['ecg_signal_contribution_pct'] for m in all_measurements])),
+            'raw_ff_output_mean': float(np.mean([m['raw_ff_output'] for m in all_measurements])),
+            'ff_gate_tanh_mean': float(np.mean([m['ff_gate_tanh'] for m in all_measurements])),
+            'ff_contribution_mean': float(np.mean([m['ff_contribution'] for m in all_measurements])),
+            'ff_contribution_pct_mean': float(np.mean([m['ff_contribution_pct'] for m in all_measurements])),
+            'n_measurements': len(all_measurements)
+        }
+
+        return summary
+
+
 # Monkey-patch FlamingoLayer to add attention_type property for compatibility with newer transformers
-from open_flamingo.src.flamingo_lm import FlamingoLayer
 
 
 def _attention_type_property(self):
@@ -32,7 +207,8 @@ def _attention_type_property(self):
 
 
 # Add the attention_type property to FlamingoLayer
-FlamingoLayer.attention_type = property(_attention_type_property) # type: ignore
+FlamingoLayer.attention_type = property(
+    _attention_type_property)  # type: ignore
 
 
 class OpenTSLMFlamingo(TimeSeriesLLM):
@@ -111,7 +287,8 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
                 f"We require the attribute name for the nn.ModuleList in the decoder storing the transformer block layers. Please supply this string manually."
             )
 
-        decoder_layers_attr_name = _infer_decoder_layers_attr_name(lang_encoder)
+        decoder_layers_attr_name = _infer_decoder_layers_attr_name(
+            lang_encoder)
         lang_encoder.set_decoder_layers_attr_name(decoder_layers_attr_name)
         lang_encoder.resize_token_embeddings(len(text_tokenizer))
 
@@ -125,7 +302,7 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
                 )
 
         model = TimeSeriesFlamingoWithTrainableEncoder(
-            SimpleNamespace(visual=time_series_encoder),
+            time_series_encoder,
             lang_encoder,
             text_tokenizer.encode("<|endofchunk|>")[-1],
             text_tokenizer.encode("<image>")[-1],
@@ -136,7 +313,8 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
 
         # Freeze all parameters
         model.requires_grad_(False)
-        assert sum(p.numel() for p in model.parameters() if p.requires_grad) == 0
+        assert sum(p.numel()
+                   for p in model.parameters() if p.requires_grad) == 0
 
         # Unfreeze perceiver, gated_cross_attn_layers, and LM input embeddings
         model.perceiver.requires_grad_(True)
@@ -151,6 +329,91 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
         self.model = model
         self.llm = model
         self.text_tokenizer = text_tokenizer
+
+        # Initialize signal contribution tracker (disabled by default)
+        self._signal_tracker = SignalContributionTracker()
+        self._signal_tracker.register_hooks(model)
+
+    def enable_signal_tracking(self):
+        """Enable signal contribution tracking during forward passes."""
+        self._signal_tracker.enable()
+        print("[OpenTSLMFlamingo] Signal contribution tracking ENABLED")
+
+    def disable_signal_tracking(self):
+        """Disable signal contribution tracking."""
+        self._signal_tracker.disable()
+        print("[OpenTSLMFlamingo] Signal contribution tracking DISABLED")
+
+    def clear_signal_measurements(self):
+        """Clear all collected signal contribution measurements."""
+        self._signal_tracker.clear()
+
+    def get_signal_contribution_summary(self) -> Dict:
+        """
+        Get summary of signal contribution metrics.
+
+        Returns dict with per-layer and overall stats including:
+        ecg_signal_contribution_pct (TRUE ECG influence), ff_contribution_pct, total_contribution_pct.
+        """
+        return self._signal_tracker.get_summary()
+
+    def print_signal_contribution_summary(self):
+        """Print a formatted summary of signal contribution metrics."""
+        summary = self.get_signal_contribution_summary()
+
+        if 'error' in summary:
+            print(f"[Signal Contribution] {summary['error']}")
+            return
+
+        print("\n" + "=" * 70)
+        print("SIGNAL CONTRIBUTION SUMMARY")
+        print("=" * 70)
+
+        overall = summary['overall']
+        print(
+            f"\nOverall (across all {overall['n_measurements']} measurements):")
+        print(
+            f"  Residual stream magnitude:      {overall['residual_stream_mean']:.4f}")
+        print(f"\n  *** RAW MODULE OUTPUTS (before gating) ***")
+        print(
+            f"  Raw attention output:           {overall['raw_attn_output_mean']:.4f}")
+        print(
+            f"  Raw FF output:                  {overall['raw_ff_output_mean']:.4f}")
+        print(f"\n  *** GATE VALUES ***")
+        print(
+            f"  tanh(attn_gate):                {overall['attn_gate_tanh_mean']:.6f}")
+        print(
+            f"  tanh(ff_gate):                  {overall['ff_gate_tanh_mean']:.6f}")
+        print(f"\n  *** TRUE ECG SIGNAL CONTRIBUTION ***")
+        print(
+            f"  ECG contribution (raw*gate):    {overall['ecg_signal_contribution_mean']:.6f}")
+        print(
+            f"  ECG contribution %:             {overall['ecg_signal_contribution_pct_mean']:.4f}%")
+        print(f"\n  *** FEEDFORWARD CONTRIBUTION ***")
+        print(
+            f"  FF contribution (raw*gate):     {overall['ff_contribution_mean']:.4f}")
+        print(
+            f"  FF contribution %:              {overall['ff_contribution_pct_mean']:.4f}%")
+        print(f"\n  *** TOTAL (ECG + FF) ***")
+        print(
+            f"  Total contribution:             {overall['total_contribution_mean']:.4f}")
+        print(
+            f"  Total contribution %:           {overall['total_contribution_pct_mean']:.4f}%")
+
+        print(f"\nPer-layer breakdown:")
+        for layer_name in sorted(summary.keys(), key=lambda x: int(x.split('_')[1]) if x != 'overall' else -1):
+            if layer_name == 'overall':
+                continue
+            s = summary[layer_name]
+            print(
+                f"  {layer_name}: ECG={s['ecg_signal_contribution_pct_mean']:.4f}%, FF={s['ff_contribution_pct_mean']:.4f}%, Total={s['total_contribution_pct_mean']:.4f}%")
+
+        print("=" * 70)
+
+    @property
+    def tokenizer(self):
+        """Alias for text_tokenizer for compatibility."""
+        return self.text_tokenizer
 
     def pad_and_apply_batch(
         self, batch: List[Dict[str, any]], include_labels: bool
@@ -185,7 +448,8 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
 
         cast_dtype = None
         tokenizer = self.text_tokenizer
-        media_token_id = tokenizer("<image>", add_special_tokens=False)["input_ids"][-1]
+        media_token_id = tokenizer("<image>", add_special_tokens=False)[
+            "input_ids"][-1]
         endofchunk_token_id = tokenizer("<|endofchunk|>", add_special_tokens=False)[
             "input_ids"
         ][-1]
@@ -215,7 +479,8 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
                 continue
 
             # Store the prompt length in tokens
-            prompt_tokens = tokenizer(prompt_text, add_special_tokens=False).input_ids
+            prompt_tokens = tokenizer(
+                prompt_text, add_special_tokens=False).input_ids
             prompt_lengths.append(len(prompt_tokens))
 
             # Add the answer to create full text
@@ -223,9 +488,11 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
             text_inputs.append(full_text)
 
         # Tokenize full text (prompt + answer)
-        tokenized = tokenizer(text_inputs, padding="longest", return_tensors="pt")
+        tokenized = tokenizer(
+            text_inputs, padding="longest", return_tensors="pt")
         input_ids = tokenized.input_ids.to(self.device, non_blocking=True)
-        attention_mask = tokenized.attention_mask.to(self.device, non_blocking=True)
+        attention_mask = tokenized.attention_mask.to(
+            self.device, non_blocking=True)
 
         if include_labels:
             return input_ids, images, attention_mask, None
@@ -235,7 +502,8 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
 
         # Set labels for answer tokens using the stored prompt lengths
         for i, prompt_length in enumerate(prompt_lengths):
-            non_padding_indices = torch.where(input_ids[i] != tokenizer.pad_token_id)[0]
+            non_padding_indices = torch.where(
+                input_ids[i] != tokenizer.pad_token_id)[0]
             answer_indices = non_padding_indices[non_padding_indices >= prompt_length]
 
             if len(answer_indices) > 0:
@@ -267,7 +535,7 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
                 )
 
                 # Remove input ids from generation
-                answer_only_ids = gen_ids[:, input_ids.shape[1] :]
+                answer_only_ids = gen_ids[:, input_ids.shape[1]:]
 
                 return self.text_tokenizer.batch_decode(
                     answer_only_ids, skip_special_tokens=True
@@ -293,6 +561,73 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
         )
         return output[0]
 
+    def compute_class_logprobs(
+        self,
+        sample: Dict[str, Any],
+        answer_vocab: List[str],
+    ) -> torch.Tensor:
+        """
+        Teacher-forced scoring for every candidate in *answer_vocab*.
+
+        Builds a batch of B copies of *sample* (each with a different candidate
+        in the "answer" field), runs one batched forward pass through the
+        Flamingo model, and extracts the sequence log-probability of each
+        candidate's tokens using the label mask produced by pad_and_apply_batch.
+
+        Returns a 1-D CPU float32 tensor of shape (B,).
+        """
+        B = len(answer_vocab)
+
+        # 1. Build batch of B copies, one per candidate answer.
+        batch = []
+        for candidate in answer_vocab:
+            s = copy.deepcopy(sample)
+            s["answer"] = candidate
+            batch.append(s)
+
+        # 2. Use existing machinery: include_labels=False → full text (prompt+answer)
+        #    with labels=-100 at prompt positions and real token IDs at answer positions.
+        with torch.no_grad():
+            input_ids, images, attention_mask, labels = self.pad_and_apply_batch(
+                batch, include_labels=False
+            )
+
+        # 3. Forward pass without labels → get logits, not loss.
+        original_disable = torch._dynamo.config.disable
+        torch._dynamo.config.disable = True
+        try:
+            with torch.no_grad():
+                output = self.model(
+                    vision_x=images,
+                    lang_x=input_ids,
+                    attention_mask=attention_mask,
+                )
+        finally:
+            torch._dynamo.config.disable = original_disable
+
+        # output may be a tuple (logits, ...) or a dataclass with .logits
+        if isinstance(output, tuple):
+            logits = output[0]
+        else:
+            logits = output.logits
+        # logits: [B, S, vocab_size]
+
+        # 4. Shift-by-1: logits[b, t, :] predicts token at position t+1.
+        shifted_logits = logits[:, :-1, :].float()    # [B, S-1, V]
+        shifted_labels = labels[:, 1:].contiguous()   # [B, S-1]
+        answer_mask = (shifted_labels != -100)         # [B, S-1] bool
+
+        # 5. Gather log-probs for answer token positions and sum.
+        log_probs = F.log_softmax(shifted_logits, dim=-1)
+        gathered = log_probs.gather(
+            dim=-1,
+            index=shifted_labels.clamp(min=0).unsqueeze(-1),  # [B, S-1, 1]
+        ).squeeze(-1)  # [B, S-1]
+        gathered = gathered * answer_mask.float()   # zero out prompt positions
+        seq_logprobs = gathered.sum(dim=-1)         # [B]
+
+        return seq_logprobs.cpu()
+
     def get_eos_token(self) -> str:
         return self.text_tokenizer.eos_token
 
@@ -309,7 +644,9 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
 
     def load_from_file(self, path: str = "best_model.pt"):
         """
-        Load model parameters with non-strict loading to handle Flamingo-specific layers.
+        Load model parameters saved by store_to_file().
+        store_to_file() saves self.llm.state_dict(), so we restore into self.llm
+        to avoid a model.* prefix mismatch when loading into the full wrapper.
         """
         checkpoint = torch.load(path, map_location=self.device)
 
@@ -320,18 +657,8 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
         else:
             raise RuntimeError("No recognized model state key in checkpoint.")
 
-        # Handle DDP (DistributedDataParallel) if needed
-        if hasattr(self, "module"):
-            model_state = {f"module.{k}": v for k, v in model_state.items()}
-
-        # Remove 'model.' prefix if present in checkpoint keys
-        if all(k.startswith("model.") for k in model_state.keys()):
-            model_state = {
-                k.replace("model.", "", 1): v for k, v in model_state.items()
-            }
-
-        # Load state dict with strict=False to handle missing/unexpected keys
-        missing_keys, unexpected_keys = self.load_state_dict(model_state, strict=False)
+        missing_keys, unexpected_keys = self.llm.load_state_dict(
+            model_state, strict=False)
         if missing_keys:
             print(f"⚠️  Warning: Missing keys when loading checkpoint:")
             for key in missing_keys[:10]:

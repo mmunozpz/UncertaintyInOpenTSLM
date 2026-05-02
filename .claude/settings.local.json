@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(json.dumps\\({k:d[k] for k in list\\(d.keys\\(\\)\\)[:8]}, indent=2\\)\\)\")",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\mmuno\\\\agentic_labs\\\\UncertaintyInOpenTSLM\\\\src\" -Recurse -Exclude venv | ForEach-Object { $_.FullName.Replace\\('C:\\\\Users\\\\mmuno\\\\agentic_labs\\\\UncertaintyInOpenTSLM\\\\', ''\\) } | Sort-Object)",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\mmuno\\\\agentic_labs\\\\UncertaintyInOpenTSLM\\\\src\\\\opentslm\\\\\" -Recurse -Force | Sort-Object FullName | ForEach-Object { $_.FullName })"
+    ]
+  }
+}

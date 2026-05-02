@@ -2,12 +2,15 @@
 """
 plot_mcspu.py  —  Visualise MCSPU results for all stages / sigma sweeps.
 
-Produces 5 figures saved to plots/:
-  1. mcspu_vs_sigma.pdf   — Mean ± 95% CI MCSPU score vs noise σ per dataset
-  2. distributions.pdf    — Violin plots of per-sample MCSPU at every σ
-  3. heatmap.pdf          — Mean MCSPU colour-coded (datasets × sigmas)
-  4. accuracy.pdf         — Clean-signal accuracy per dataset
-  5. mcspu_vs_conf.pdf    — MCSPU vs (1 − max clean prob) scatter per dataset
+Produces 8 figures saved to plots/:
+  1. mcspu_vs_sigma.png              — Mean ± 95% CI MCSPU score vs noise σ per dataset
+  2. distributions.png               — Violin plots of per-sample MCSPU at every σ
+  3. heatmap.png                     — Mean MCSPU colour-coded (datasets × sigmas)
+  4. mcspu_vs_conf_sigma_0.1.png     — MCSPU vs (1 − max clean prob) scatter, σ=0.1
+  5. mcspu_vs_conf_sigma_0.5.png     — MCSPU vs (1 − max clean prob) scatter, σ=0.5
+  6. mcspu_vs_conf_sigma_1.0.png     — MCSPU vs (1 − max clean prob) scatter, σ=1.0
+  7. mcspu_vs_conf_sigma_2.0.png     — MCSPU vs (1 − max clean prob) scatter, σ=2.0
+  8. table.png                       — Pearson r (MCSPU vs 1−max_prob) table: datasets × sigmas
 
 Usage:
     python plot_mcspu.py
@@ -16,11 +19,9 @@ Usage:
 
 import argparse
 import json
-import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 import numpy as np
 
 try:
@@ -58,28 +59,6 @@ STYLE = {
     "grid.alpha":       0.3,
     "grid.linestyle":   "--",
 }
-
-
-# ---------------------------------------------------------------------------
-# Parsing helpers
-# ---------------------------------------------------------------------------
-
-def _extract_gt_label(ground_truth: str, dataset: str) -> str:
-    """Extract the short answer label from a (possibly CoT) ground_truth string."""
-    gt = ground_truth.strip()
-
-    if dataset == "tsqa":
-        # format: "(b)<|end_of_text|>"  →  "B"
-        m = re.search(r"\(([a-dA-D])\)", gt)
-        return m.group(1).upper() if m else gt
-
-    # HAR / Sleep / ECG: "… Answer: <label>[.]<|end_of_text|>"
-    m = re.search(r"Answer:\s*(.+?)\.?\s*(?:<\|end_of_text\|>)?$", gt)
-    if m:
-        return m.group(1).strip()
-
-    # fallback: strip EOS token
-    return gt.replace("<|end_of_text|>", "").strip().rstrip(".")
 
 
 def load_results(results_dir: Path) -> dict:
@@ -134,9 +113,8 @@ def plot_mcspu_vs_sigma(data: dict, out_dir: Path):
     ax.set_xticks(SIGMAS)
     ax.legend(frameon=False)
     fig.tight_layout()
-    path = out_dir / "mcspu_vs_sigma.pdf"
+    path = out_dir / "mcspu_vs_sigma.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
-    fig.savefig(path.with_suffix(".png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {path}")
 
@@ -182,9 +160,8 @@ def plot_distributions(data: dict, out_dir: Path):
 
     fig.suptitle("Per-sample MCSPU distributions", fontsize=12, y=1.01)
     fig.tight_layout()
-    path = out_dir / "distributions.pdf"
+    path = out_dir / "distributions.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
-    fig.savefig(path.with_suffix(".png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {path}")
 
@@ -226,109 +203,125 @@ def plot_heatmap(data: dict, out_dir: Path):
                         fontsize=8.5, color=text_col, fontweight="bold")
 
     fig.tight_layout()
-    path = out_dir / "heatmap.pdf"
+    path = out_dir / "heatmap.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
-    fig.savefig(path.with_suffix(".png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {path}")
 
 
 # ---------------------------------------------------------------------------
-# Figure 4: Clean-signal accuracy per dataset
-# ---------------------------------------------------------------------------
-
-def plot_accuracy(data: dict, out_dir: Path):
-    # Use sigma=1.0 as the representative run; accuracy is independent of sigma
-    sigma = 1.0
-    labels, accs, errs = [], [], []
-
-    for stage_key, label in STAGES.items():
-        if stage_key not in data or sigma not in data[stage_key]:
-            continue
-        records = data[stage_key][sigma]
-        dataset_name = records[0]["dataset"]
-        correct = 0
-        for r in records:
-            pred = r["clean_pred"].strip().lower()
-            gt = _extract_gt_label(r["ground_truth"], dataset_name).strip().lower()
-            if pred == gt:
-                correct += 1
-        n = len(records)
-        p = correct / n
-        # Wilson confidence interval approximation
-        z = 1.96
-        denom = 1 + z**2 / n
-        centre = (p + z**2 / (2 * n)) / denom
-        margin = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
-        labels.append(label)
-        accs.append(p)
-        errs.append(margin)
-
-    x = np.arange(len(labels))
-    colours = [PALETTE[l] for l in labels]
-
-    fig, ax = plt.subplots(figsize=(5, 3.5))
-    bars = ax.bar(x, accs, yerr=errs, color=colours, alpha=0.85,
-                  capsize=4, error_kw={"linewidth": 1.2})
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.set_ylabel("Accuracy (clean signal)")
-    ax.set_ylim(0, 1.05)
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
-    ax.set_title("Clean-signal prediction accuracy")
-
-    for bar, acc in zip(bars, accs):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
-                f"{acc:.1%}", ha="center", va="bottom", fontsize=9)
-
-    fig.tight_layout()
-    path = out_dir / "accuracy.pdf"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    fig.savefig(path.with_suffix(".png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  saved {path}")
-
-
-# ---------------------------------------------------------------------------
-# Figure 5: MCSPU vs model confidence (1 − max clean prob)
+# Figure 4: MCSPU vs model confidence (1 − max clean prob)
 # ---------------------------------------------------------------------------
 
 def plot_mcspu_vs_confidence(data: dict, out_dir: Path):
-    sigma = 1.0
-    fig, axes = plt.subplots(1, len(STAGES), figsize=(4 * len(STAGES), 3.8), sharey=False)
+    for sigma in SIGMAS:
+        fig, axes = plt.subplots(1, len(STAGES), figsize=(4 * len(STAGES), 3.8), sharey=False)
 
-    for col, (stage_key, label) in enumerate(STAGES.items()):
-        ax = axes[col]
-        colour = PALETTE[label]
+        for col, (stage_key, label) in enumerate(STAGES.items()):
+            ax = axes[col]
+            colour = PALETTE[label]
 
-        if stage_key not in data or sigma not in data[stage_key]:
-            ax.set_visible(False)
+            if stage_key not in data or sigma not in data[stage_key]:
+                ax.set_visible(False)
+                continue
+
+            records = data[stage_key][sigma]
+            mcspu  = np.array([r["mcspu_score"] for r in records])
+            conf   = np.array([max(r["clean_probs"]) for r in records])
+            uncertainty = 1.0 - conf
+
+            ax.scatter(uncertainty, mcspu, alpha=0.4, s=18, color=colour, edgecolors="none")
+
+            corr = np.corrcoef(mcspu, uncertainty)[0, 1]
+            ax.set_title(f"{label}\n(r = {corr:.2f})", fontsize=10)
+            ax.set_xlabel("1 − max clean prob")
+            if col == 0:
+                ax.set_ylabel("MCSPU score")
+
+            z = np.polyfit(uncertainty, mcspu, 1)
+            xline = np.linspace(uncertainty.min(), uncertainty.max(), 100)
+            ax.plot(xline, np.polyval(z, xline), color=colour, linewidth=1.5, linestyle="--")
+
+        fig.suptitle(f"MCSPU vs model confidence (σ = {sigma})", fontsize=12)
+        fig.tight_layout()
+        path = out_dir / f"mcspu_vs_conf_sigma_{sigma}.png"
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  saved {path}")
+
+
+# ---------------------------------------------------------------------------
+# Figure 5: Pearson r table (datasets × sigmas)
+# ---------------------------------------------------------------------------
+
+def plot_r_table(data: dict, out_dir: Path):
+    dataset_labels = list(STAGES.values())
+    sigma_labels   = [f"σ={s}" for s in SIGMAS]
+
+    # Build matrix of r values
+    r_matrix = np.full((len(STAGES), len(SIGMAS)), np.nan)
+    for i, (stage_key, label) in enumerate(STAGES.items()):
+        if stage_key not in data:
             continue
+        for j, sigma in enumerate(SIGMAS):
+            if sigma not in data[stage_key]:
+                continue
+            records = data[stage_key][sigma]
+            mcspu       = np.array([r["mcspu_score"] for r in records])
+            uncertainty = np.array([1.0 - max(r["clean_probs"]) for r in records])
+            r_matrix[i, j] = np.corrcoef(mcspu, uncertainty)[0, 1]
 
-        records = data[stage_key][sigma]
-        mcspu  = np.array([r["mcspu_score"] for r in records])
-        conf   = np.array([max(r["clean_probs"]) for r in records])
-        uncertainty = 1.0 - conf
+    fig, ax = plt.subplots(figsize=(5, 2.4))
+    ax.axis("off")
 
-        ax.scatter(uncertainty, mcspu, alpha=0.4, s=18, color=colour, edgecolors="none")
+    cell_text  = [[f"{r_matrix[i, j]:.2f}" if not np.isnan(r_matrix[i, j]) else "—"
+                   for j in range(len(SIGMAS))]
+                  for i in range(len(dataset_labels))]
 
-        # Pearson correlation
-        corr = np.corrcoef(mcspu, uncertainty)[0, 1]
-        ax.set_title(f"{label}\n(r = {corr:.2f})", fontsize=10)
-        ax.set_xlabel("1 − max clean prob")
-        if col == 0:
-            ax.set_ylabel("MCSPU score")
+    # Colour each cell by sign: red for negative, blue for positive
+    cell_colours = []
+    for i in range(len(dataset_labels)):
+        row_colours = []
+        for j in range(len(SIGMAS)):
+            val = r_matrix[i, j]
+            if np.isnan(val):
+                row_colours.append("#f0f0f0")
+            elif val < 0:
+                intensity = min(abs(val), 1.0)
+                r_ch = int(255 - (255 - 220) * intensity)
+                g_ch = int(255 - (255 - 100) * intensity)
+                b_ch = int(255 - (255 - 100) * intensity)
+                row_colours.append(f"#{r_ch:02x}{g_ch:02x}{b_ch:02x}")
+            else:
+                intensity = min(abs(val), 1.0)
+                r_ch = int(255 - (255 - 100) * intensity)
+                g_ch = int(255 - (255 - 149) * intensity)
+                b_ch = int(255 - (255 - 237) * intensity)
+                row_colours.append(f"#{r_ch:02x}{g_ch:02x}{b_ch:02x}")
+        cell_colours.append(row_colours)
 
-        # Trend line
-        z = np.polyfit(uncertainty, mcspu, 1)
-        xline = np.linspace(uncertainty.min(), uncertainty.max(), 100)
-        ax.plot(xline, np.polyval(z, xline), color=colour, linewidth=1.5, linestyle="--")
+    tbl = ax.table(
+        cellText=cell_text,
+        cellColours=cell_colours,
+        rowLabels=dataset_labels,
+        colLabels=sigma_labels,
+        rowColours=[PALETTE[l] for l in dataset_labels],
+        loc="center",
+        cellLoc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(11)
+    tbl.scale(1, 1.6)
 
-    fig.suptitle("MCSPU vs model confidence (σ = 1.0)", fontsize=12)
+    # Make row label text white for readability against the dataset colour
+    for i, label in enumerate(dataset_labels):
+        tbl[(i + 1, -1)].get_text().set_color("white")
+        tbl[(i + 1, -1)].get_text().set_fontweight("bold")
+
+    ax.set_title("Pearson r  (MCSPU vs 1 − max clean prob)", fontsize=11, pad=10)
     fig.tight_layout()
-    path = out_dir / "mcspu_vs_conf.pdf"
+    path = out_dir / "table.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
-    fig.savefig(path.with_suffix(".png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {path}")
 
@@ -355,8 +348,8 @@ def main():
     plot_mcspu_vs_sigma(data, args.out_dir)
     plot_distributions(data, args.out_dir)
     plot_heatmap(data, args.out_dir)
-    plot_accuracy(data, args.out_dir)
     plot_mcspu_vs_confidence(data, args.out_dir)
+    plot_r_table(data, args.out_dir)
 
     print(f"\nAll plots saved to {args.out_dir}/")
 

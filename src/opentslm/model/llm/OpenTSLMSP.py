@@ -48,7 +48,7 @@ class OpenTSLMSP(TimeSeriesLLM):
             llm_id,
             torch_dtype=torch.bfloat16,
             device_map={"": device},
-            attn_implementation="eager",
+            attn_implementation="sdpa",
         )
         self.llm.resize_token_embeddings(len(self.tokenizer))
 
@@ -369,32 +369,25 @@ class OpenTSLMSP(TimeSeriesLLM):
         self,
         sample: Dict[str, Any],
         answer_vocab: List[str],
+        class_batch_size: int = 4,
     ) -> torch.Tensor:
         """
         Teacher-forced scoring for every candidate in *answer_vocab*.
 
-        Encodes the prompt (time series + text) exactly once, then appends
-        each candidate answer's embeddings to form B sequences (B = len(answer_vocab)).
-        A single batched forward pass gives the vocabulary logits; we gather
-        the log-prob of each candidate's actual tokens and sum to get
-        log P(answer | prompt) per candidate.
+        Encodes the prompt once, then scores candidates in chunks of
+        *class_batch_size* to bound GPU memory (ECG prompts are very long;
+        scoring all candidates at once causes OOM for large answer sets).
 
         Returns a 1-D CPU float32 tensor of shape (B,).
         """
-        B = len(answer_vocab)
         device = self.device
 
         # 1. Encode the prompt once (batch of 1).
         with torch.no_grad():
             embeds_1, mask_1 = self.pad_and_apply_batch([copy.deepcopy(sample)])
-        L = embeds_1.shape[1]  # prompt length (no padding for batch-of-1)
+        L = embeds_1.shape[1]  # prompt length
 
-        # 2. Tile prompt embeddings to batch size B.
-        inputs_embeds = embeds_1.expand(B, -1, -1)   # [B, L, H]
-        attention_mask = mask_1.expand(B, -1)         # [B, L]
-
-        # 3. Tokenize all answer candidates.
-        #    add_special_tokens=False avoids prepending BOS into the answer.
+        # 2. Tokenize all answer candidates up front.
         ans_tok = self.tokenizer(
             answer_vocab,
             return_tensors="pt",
@@ -402,39 +395,57 @@ class OpenTSLMSP(TimeSeriesLLM):
             truncation=True,
             add_special_tokens=False,
         )
-        ans_ids = ans_tok.input_ids.to(device)    # [B, A_max]
-        ans_mask = ans_tok.attention_mask.to(device)  # [B, A_max]
-        A_max = ans_ids.shape[1]
+        ans_ids_all = ans_tok.input_ids.to(device)    # [B, A_max]
+        ans_mask_all = ans_tok.attention_mask.to(device)  # [B, A_max]
+        A_max = ans_ids_all.shape[1]
+        B = len(answer_vocab)
 
-        # 4. Embed answers and concatenate after prompt.
-        with torch.no_grad():
-            ans_emb = self.llm.get_input_embeddings()(ans_ids)  # [B, A_max, H]
-        full_embeds = torch.cat([inputs_embeds, ans_emb], dim=1)  # [B, L+A_max, H]
-        full_mask = torch.cat([attention_mask, ans_mask], dim=1)  # [B, L+A_max]
+        # 3. Score candidates in chunks to stay within GPU memory budget.
+        seq_logprobs_chunks: List[torch.Tensor] = []
+        for start in range(0, B, class_batch_size):
+            end = min(start + class_batch_size, B)
+            chunk_size = end - start
 
-        # 5. Single forward pass (no labels → just logits).
-        with torch.no_grad():
-            outputs = self.llm(
-                inputs_embeds=full_embeds,
-                attention_mask=full_mask,
-                return_dict=True,
-            )
-        logits = outputs.logits  # [B, L+A_max, vocab_size]
+            ans_ids = ans_ids_all[start:end]    # [C, A_max]
+            ans_mask = ans_mask_all[start:end]  # [C, A_max]
 
-        # 6. Shift-by-1: logits[:, L-1+t, :] predicts the t-th answer token.
-        #    Slice out exactly A_max positions.
-        answer_logits = logits[:, L - 1 : L - 1 + A_max, :]  # [B, A_max, V]
-        log_probs = F.log_softmax(answer_logits.float(), dim=-1)  # [B, A_max, V]
+            # Tile prompt embeddings for this chunk only.
+            inputs_embeds = embeds_1.expand(chunk_size, -1, -1)  # [C, L, H]
+            attention_mask = mask_1.expand(chunk_size, -1)        # [C, L]
 
-        # 7. Gather log-prob for each candidate's actual tokens, then mask padding.
-        gathered = log_probs.gather(
-            dim=-1,
-            index=ans_ids.clamp(min=0).unsqueeze(-1),  # [B, A_max, 1]
-        ).squeeze(-1)  # [B, A_max]
-        gathered = gathered * ans_mask.float()          # zero out padding positions
-        seq_logprobs = gathered.sum(dim=-1)             # [B]
+            with torch.no_grad():
+                ans_emb = self.llm.get_input_embeddings()(ans_ids)  # [C, A_max, H]
+            full_embeds = torch.cat([inputs_embeds, ans_emb], dim=1)  # [C, L+A_max, H]
+            full_mask = torch.cat([attention_mask, ans_mask], dim=1)  # [C, L+A_max]
 
-        return seq_logprobs.cpu()
+            with torch.no_grad():
+                outputs = self.llm(
+                    inputs_embeds=full_embeds,
+                    attention_mask=full_mask,
+                    return_dict=True,
+                )
+            logits = outputs.logits  # [C, L+A_max, vocab_size]
+
+            answer_logits = logits[:, L - 1 : L - 1 + A_max, :]  # [C, A_max, V]
+            log_probs = F.log_softmax(answer_logits.float(), dim=-1)  # [C, A_max, V]
+
+            gathered = log_probs.gather(
+                dim=-1,
+                index=ans_ids.clamp(min=0).unsqueeze(-1),
+            ).squeeze(-1)                               # [C, A_max]
+            gathered = gathered * ans_mask.float()
+            seq_logprobs_chunks.append(gathered.sum(dim=-1).cpu())  # [C]
+
+            # Free chunk tensors before next iteration.
+            del outputs, logits, full_embeds, full_mask, ans_emb
+            if device != "cpu":
+                torch.cuda.empty_cache()
+
+        del embeds_1, mask_1
+        if device != "cpu":
+            torch.cuda.empty_cache()
+
+        return torch.cat(seq_logprobs_chunks, dim=0)  # [B]
 
     def get_eos_token(self) -> str:
         return self.tokenizer.eos_token

@@ -1,0 +1,312 @@
+================================================================
+MCSPU UNCERTAINTY TEST SUITE — TEAM GUIDE
+================================================================
+Project:  OpenTSLM uncertainty quantification
+Script:   opentslm_uncertainty_test.py
+Author:   UncertaintyInOpenTSLM research branch
+Date:     2026-05
+
+----------------------------------------------------------------
+QUICK START
+----------------------------------------------------------------
+
+Run everything (GPU, all 4 stages):
+
+    python opentslm_uncertainty_test.py \
+        --models_dir models/ \
+        --device     cuda
+
+That single command loads 4 models, evaluates them on their test
+sets across 4 noise levels, runs all tests, prints a colour-coded
+pass/fail report, and writes 5 plots to plots/.
+
+If you have a non-standard setup:
+
+    python opentslm_uncertainty_test.py \
+        --models_dir  /path/to/checkpoints/ \
+        --llm_id      meta-llama/Llama-3.2-1B \
+        --device      cuda \
+        --n_noise     50 \
+        --max_samples 200 \
+        --class_batch 8 \
+        --out_dir     results/plots/
+
+
+----------------------------------------------------------------
+BACKGROUND: WHAT IS MCSPU?
+----------------------------------------------------------------
+
+Monte Carlo Signal Perturbation Uncertainty (MCSPU) is a
+per-sample score that measures how much a model's output
+distribution changes when the input time-series is perturbed
+by small additive Gaussian noise.
+
+Formally, for one test sample:
+
+    U_signal(x) = (1/N) Σ_i  KL( p_clean || p_noisy_i )
+
+where:
+  p_clean   = model output distribution on the real signal
+  p_noisy_i = model output distribution on signal + ε_i
+  ε_i       ~ N(0, σ²)   (additive noise)
+  N         = number of noise draws (default: 50)
+
+Interpretation:
+  HIGH U_signal → model output shifts when signal is perturbed
+                  → model actively uses the signal content
+  LOW  U_signal → model output barely changes regardless of signal
+                  → model ignores the signal, answers from text/prior
+
+We sweep σ ∈ {0.1, 0.5, 1.0, 2.0} to check that models
+show INCREASING sensitivity as noise gets larger.
+
+Key differences from the upstream NoiseInjectionMixin:
+  Upstream:  replaces signal with pure noise   (binary ablation)
+  MCSPU:     ADDS small noise to real signal   (continuous score)
+  Upstream:  measures population-level accuracy drop
+  MCSPU:     measures per-sample output distribution shift
+
+
+----------------------------------------------------------------
+MODELS UNDER TEST
+----------------------------------------------------------------
+
+  Stage 1 — TSQA         checkpoint: models/stage1_tsqa_sp.pt
+  Stage 3 — HAR          checkpoint: models/stage3_har_sp.pt
+  Stage 4 — Sleep EDF    checkpoint: models/stage4_sleep_sp.pt
+  Stage 5 — ECG-QA      checkpoint: models/stage5_ecg_sp.pt
+
+Expected outcomes:
+  TSQA, HAR, Sleep EDF   → USES SIGNAL   (sensitivity tests PASS)
+  ECG-QA                 → IGNORES SIGNAL (sensitivity tests FAIL)
+
+ECG-QA failing is the KEY FINDING — the pretrained ECG model does
+not use the ECG signal; it answers from text context alone.
+This is consistent with the upstream paper's noise-injection result.
+
+
+================================================================
+TEST CATEGORIES
+================================================================
+
+There are two categories with different pass/fail semantics.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CATEGORY 1 — SANITY TESTS
+Mathematical invariants. ALL four models must pass.
+A failure here means the computation itself is broken.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TEST: no_nan_inf_scores
+  What:   Checks every mcspu_score is a finite real number.
+  Why:    NaN/Inf indicates numerical overflow (e.g., log(0) in KL)
+          or a model that returned degenerate probabilities.
+  Pass:   0 records with NaN or Inf mcspu_score.
+  Data:   All 4 models: 0 bad records across 800 records each.
+
+TEST: kl_nonneg
+  What:   Checks every individual KL divergence value ≥ 0.
+  Why:    KL(P||Q) ≥ 0 is a mathematical theorem (Gibbs inequality).
+          A negative value means numerical error in the computation.
+  Pass:   min(per_noise_kl) ≥ −1e-9  (tiny tolerance for float rounding)
+  Data:   All 4 models: minimum observed KL = 0.000000 nats.
+
+TEST: score_consistency
+  What:   Checks mcspu_score ≈ mean(per_noise_kl) for every record.
+  Why:    mcspu_score is defined as the mean of per_noise_kl.
+          Disagreement means the output was not assembled correctly.
+  Pass:   max |mcspu_score − mean(per_noise_kl)| ≤ 1e-5 nats.
+  Data:   All 4 models: maximum observed delta < 1e-7 nats (float32 precision).
+
+TEST: probs_normalized
+  What:   Checks that clean_probs sums to 1.0 for every record.
+  Why:    The output of softmax must be a valid probability distribution.
+          Large deviations indicate a tokenization or logit error.
+  Pass:   max |Σ clean_probs − 1.0| ≤ 1e-3.
+  Data:   All 4 models: maximum observed deviation < 5e-7.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CATEGORY 2 — SIGNAL SENSITIVITY TESTS
+Behavioural tests. TSQA/HAR/Sleep must PASS; ECG must FAIL.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TEST: sensitivity_magnitude
+  What:   Mean MCSPU score at σ=2.0 (the largest perturbation).
+  Why:    A model that uses the signal must show measurable output
+          shift when the signal is heavily corrupted. A model that
+          ignores the signal will show near-zero shift at any σ.
+  Threshold: mean_mcspu(σ=2.0) > 0.05 nats
+  Threshold justification:
+    Observed at σ=2.0 in the 200-sample, N=50 experiment:
+      TSQA:      0.2814  →  56× above threshold
+      HAR:       0.6583  →  13× above threshold
+      Sleep EDF: 0.4642  →   9× above threshold
+      ECG-QA:    0.0011  →  45× BELOW threshold
+    The threshold of 0.05 sits in a clear gap between the
+    worst-case passing model (TSQA at 0.28) and ECG (0.001),
+    giving a separation factor of 280×. The threshold is
+    deliberately conservative to remain valid across different
+    random seeds, sample counts, and model versions.
+
+TEST: sensitivity_range
+  What:   Absolute growth MCSPU(σ=2.0) − MCSPU(σ=0.1).
+  Why:    Even if a model has non-zero MCSPU, it must INCREASE with σ
+          in absolute terms. A model ignoring the signal will have
+          the same tiny score at all σ values.
+  Threshold: MCSPU(σ=2.0) − MCSPU(σ=0.1) > 0.02 nats
+  Threshold justification:
+    Observed absolute growth:
+      TSQA:      0.2743 nats  →  14× above threshold
+      HAR:       0.6541 nats  →  33× above threshold
+      Sleep EDF: 0.4484 nats  →  22× above threshold
+      ECG-QA:    0.0000 nats  →  at noise floor (below threshold)
+    Threshold of 0.02 is 20× the ECG observed range (0.001),
+    giving ample margin against noise and sample variance.
+
+TEST: statistical_significance
+  What:   One-sided Mann-Whitney U test comparing the distribution
+          of MCSPU scores at σ=0.1 vs σ=2.0.
+          H₁: scores at σ=2.0 are stochastically greater than at σ=0.1
+  Why:    The magnitude test could theoretically be fooled by a skewed
+          distribution with a high mean but no consistent ordering.
+          The Mann-Whitney U tests the full distribution and is robust
+          to outliers and non-normality.
+  Threshold: p-value < 0.05  (standard frequentist significance level)
+  Threshold justification:
+    Observed p-values:
+      TSQA:      3.8e-67  →  rejected at any reasonable α
+      HAR:       2.4e-67  →  rejected at any reasonable α
+      Sleep EDF: 2.5e-67  →  rejected at any reasonable α
+      ECG-QA:    0.4031   →  failed to reject H₀ (no significant difference)
+    ECG-QA p=0.40 is consistent with the null hypothesis that the
+    distributions at σ=0.1 and σ=2.0 are identical — exactly what
+    we expect for a signal-ignoring model.
+
+TEST: effect_size
+  What:   Cohen's d between σ=0.1 and σ=2.0 MCSPU distributions.
+          d = (mean_hi − mean_lo) / pooled_std
+  Why:    Statistical significance alone does not tell us whether the
+          effect is practically meaningful. With N=200 samples, even
+          a trivially small difference can reach p<0.05. Cohen's d
+          measures practical significance independently of N.
+  Threshold: Cohen's d > 0.3
+  Threshold justification:
+    Cohen's conventions: 0.2=small, 0.5=medium, 0.8=large.
+    We set 0.3 (between small and medium) as the minimum for a
+    model to be considered genuinely signal-sensitive.
+    Observed d values:
+      TSQA:      2.39  →  very large effect (8× above threshold)
+      HAR:       3.58  →  very large effect (12× above threshold)
+      Sleep EDF: 1.89  →  large effect (6× above threshold)
+      ECG-QA:    0.01  →  negligible effect (30× below threshold)
+    All passing models show large-to-very-large effects, giving
+    high confidence the result is not a statistical artefact.
+
+
+================================================================
+OVERALL PASS/FAIL LOGIC
+================================================================
+
+  SANITY tests:   all 4 models MUST pass all 4 tests.
+                  Failure = broken implementation.
+
+  SENSITIVITY tests:
+    - TSQA, HAR, Sleep EDF must PASS all 4 tests.
+    - ECG-QA must FAIL all 4 tests.
+    An unexpected outcome in either direction (e.g., ECG suddenly
+    passing, or HAR failing) triggers exit code 1.
+
+  Exit code:  0 = all outcomes match expectations
+              1 = at least one unexpected outcome
+
+This means the suite can be added to CI as:
+    python opentslm_uncertainty_test.py && echo "OK" || echo "INVESTIGATE"
+
+
+================================================================
+OUTPUTS
+================================================================
+
+Terminal:
+  - Colour-coded PASS/FAIL table (both test categories)
+  - Threshold reference table with units
+  - Metric values per model
+  - Overall verdict per model
+
+Plots (saved to --out_dir, both .pdf and .png):
+
+  mcspu_vs_sigma.pdf
+    Mean MCSPU ± 95% CI vs σ for all datasets.
+    The key result figure: signal-using models rise, ECG stays flat.
+
+  distributions.pdf
+    Violin plots of per-sample MCSPU at each σ.
+    Shows within-dataset variability, not just the mean.
+
+  heatmap.pdf
+    Colour-coded grid of mean MCSPU values (dataset × sigma).
+    Good summary table for a paper or presentation.
+
+  accuracy.pdf
+    Clean-signal prediction accuracy per dataset.
+    Baseline quality check: are the models at least reasonable?
+
+  test_results.pdf
+    Green/red heatmap of PASS/FAIL per test per model.
+    The definitive at-a-glance test summary.
+
+  test_metrics.pdf
+    Bar chart of each sensitivity metric with threshold lines.
+    Shows how far each model is from the acceptance boundary.
+
+  test_sigma_sweep.pdf
+    Annotated sigma sweep with USES/IGNORES SIGNAL labels.
+
+
+================================================================
+EXPERIMENTAL PARAMETERS
+================================================================
+
+  n_noise     = 50   noise draws per sample
+                     Justification: gives SE = σ/√50 ≈ 0.14σ on the
+                     MCSPU estimate, sufficient for a reliable per-sample
+                     score. N=20 (used in early runs) gives SE≈0.22σ,
+                     too noisy for stable distributions.
+
+  max_samples = 200  test samples evaluated per sigma per dataset
+                     Justification: detects Cohen's d=0.3 with >95%
+                     power; all observed effects are d>1.9, giving
+                     essentially perfect statistical power.
+
+  sigmas      = [0.1, 0.5, 1.0, 2.0]
+                     Four points spanning small to large perturbation.
+                     σ=1.0 ≈ signal std after normalisation (interpretable
+                     as "fully corrupted std").
+
+  class_batch = 8    max answer candidates per GPU forward pass
+                     Limits peak GPU memory to ~5 GB (vs ~14 GB with
+                     batch=8 using eager attention, now fixed with SDPA).
+
+
+================================================================
+ARCHITECTURE NOTE — WHY ECG-QA FAILS
+================================================================
+
+The ECG model (stage 5, OpenTSLMSP) uses soft-prompt injection:
+the ECG signal is encoded by TransformerCNNEncoder and the patch
+embeddings are prepended to the LLM's input. In theory the LLM
+should attend to these tokens. In practice:
+
+  - ECG MCSPU is flat: mean ≈ 0.0011 at ALL σ from 0.1 to 2.0
+  - The clean prediction does not change when the ECG is replaced
+    by pure noise (confirmed by the upstream paper's noise ablation)
+  - Cohen's d between σ=0.1 and σ=2.0 is 0.01 (negligible)
+
+The model has learned to answer ECG-QA questions from the text
+context (patient demographics, question phrasing) without ever
+reading the ECG waveform. This is the central finding motivating
+the conformal prediction and signal-conditional uncertainty work
+described in research_idea_uncertainty_opentslm.txt.
+
+================================================================

@@ -96,11 +96,13 @@ class MCSpUScorer:
         n_samples: int = 50,
         sigma: float = 1.0,
         seed: Optional[int] = None,
+        class_batch_size: int = 4,
     ):
         self.model = model
         self.answer_vocab = answer_vocab
         self.n_samples = n_samples
         self.sigma = sigma
+        self.class_batch_size = class_batch_size
         self._rng = np.random.default_rng(seed)
 
     # ------------------------------------------------------------------
@@ -196,11 +198,12 @@ class MCSpUScorer:
 
     def _score(self, sample: Dict[str, Any], vocab: List[str]) -> torch.Tensor:
         """Collate sample and call model.compute_class_logprobs."""
-        # Deep-copy before in-place collation so the caller's sample is not mutated
         collated_batch = extend_time_series_to_match_patch_size_and_aggregate(
             [copy.deepcopy(sample)]
         )
         collated = collated_batch[0]
         self.model.eval()
         with torch.no_grad():
-            return self.model.compute_class_logprobs(collated, vocab)
+            return self.model.compute_class_logprobs(
+                collated, vocab, class_batch_size=self.class_batch_size
+            )

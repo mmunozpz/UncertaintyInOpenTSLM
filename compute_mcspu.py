@@ -194,6 +194,11 @@ def main():
         "--device", default=None,
         help="Device: cuda | cpu | mps (default: auto-detect)"
     )
+    parser.add_argument(
+        "--class_batch_size", type=int, default=4,
+        help="Max answer candidates per GPU forward pass (default: 4). "
+             "Reduce if OOM; increase to speed up (safe up to ~8 for ECG)."
+    )
     args = parser.parse_args()
 
     model = _load_model(args)
@@ -214,6 +219,7 @@ def main():
         n_samples=args.n_samples,
         sigma=args.sigma,
         seed=args.seed,
+        class_batch_size=args.class_batch_size,
     )
 
     print(f"Scoring {args.dataset} {args.split} split "

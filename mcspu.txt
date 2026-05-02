@@ -1,0 +1,455 @@
+================================================================
+MCSPU: WHAT WAS BUILT, HOW IT WORKS, AND WHERE IT FITS
+================================================================
+
+This document explains the MCSPU (Monte Carlo Signal Perturbation
+Uncertainty) implementation added to this repository, from first
+principles up to the code.
+
+
+----------------------------------------------------------------
+1. THE PROBLEM
+----------------------------------------------------------------
+
+OpenTSLM (the upstream codebase on GitHub at
+github.com/StanfordBDHG/OpenTSLM) is a family of time-series
+language models.  It processes raw signal data (ECG, accelerometer,
+EEG) together with a text question, and generates a natural-language
+answer.
+
+A central open question is: does the model actually USE the signal,
+or does it just answer from the text context?  The upstream paper
+showed a population-level answer: they replaced the real signal with
+random noise and measured whether accuracy dropped.  Result:
+  - HAR (activity recognition): accuracy dropped → model uses signal
+  - Sleep staging:               accuracy dropped → model uses signal
+  - ECG QA:                      accuracy ~unchanged → model IGNORES signal
+  - TSQA / M4:                   signal doesn't matter much
+
+That is a useful binary test, but it only tells you about the average
+behaviour across the test set.  It cannot tell you:
+  (a) for THIS specific sample, is the model relying on the signal?
+  (b) how MUCH does the signal contribute to the model's confidence?
+  (c) is the model uncertain because the signal is ambiguous, or
+      because the question is inherently hard?
+
+MCSPU is a per-sample uncertainty score that answers these questions.
+
+
+----------------------------------------------------------------
+2. THE MATH IDEA
+----------------------------------------------------------------
+
+For a single test sample, the model computes:
+
+    p(y | x_s, x_t)
+
+where x_s is the time-series signal and x_t is the text prompt.
+
+The MCSPU score measures how sensitive this distribution is to
+small perturbations of the signal.  Concretely:
+
+  1. Draw N noise realizations:   eps_1, ..., eps_N  ~  N(0, sigma^2)
+  2. For each, compute the perturbed output distribution:
+        p_i(y) = p(y | x_s + eps_i, x_t)
+  3. Compute the KL divergence from the clean distribution to each noisy one:
+        KL_i = KL( p_clean || p_i )
+  4. Average:
+        U_signal(x) = (1/N) * sum_i  KL_i
+
+Interpretation:
+  - HIGH U_signal: the model's output distribution shifts a lot
+    when the signal is perturbed.  The model is sensitive to
+    (and therefore relying on) the signal content.
+  - LOW U_signal: the model's output barely changes regardless
+    of what signal you give it.  It is answering from the text
+    prompt or from a learned prior, not from the signal.
+
+This is per-sample: each test example gets its own score, rather
+than a single accuracy number for the whole dataset.
+
+Key differences from the upstream noise injection (NoiseInjectionMixin):
+  - Upstream: REPLACES x_s with noise entirely.  Binary test.
+  - MCSPU: ADDS small noise to x_s (x_s + eps).  Continuous score.
+  - Upstream: one pass per sample.  MCSPU: N+1 passes per sample.
+  - Upstream: measures accuracy drop.  MCSPU: measures distribution shift.
+  - The text stats (mean/std in the prompt) are KEPT FIXED in both
+    cases so we isolate signal sensitivity from text sensitivity.
+
+
+----------------------------------------------------------------
+3. THE KL DIVERGENCE
+----------------------------------------------------------------
+
+KL(P || Q) = sum_c  P(c) * log( P(c) / Q(c) )
+
+In our case:
+  - P = p_clean, the class probability distribution from the real signal
+  - Q = p_i,     the class probability distribution with signal + noise
+
+KL measures how "surprised" you would be if you expected distribution P
+but actually got distribution Q.  If P == Q (noise made no difference),
+KL = 0.  The more the noise shifts the output, the larger KL becomes.
+
+KL is always >= 0, which is why U_signal is always >= 0.
+
+We use a small epsilon (1e-10) inside the log to avoid log(0).
+
+
+----------------------------------------------------------------
+4. HOW TEACHER-FORCED SCORING WORKS
+----------------------------------------------------------------
+
+To compute p(y | x_s, x_t), we need the model's PROBABILITY
+DISTRIBUTION over the answer space, not just the argmax text output.
+
+The model's generate() method only returns the most likely text string.
+To get probabilities, we use "teacher-forced scoring":
+
+  For each candidate answer c in the answer vocabulary:
+    1. Build the full sequence: [prompt tokens] + [c tokens]
+    2. Run one forward pass through the model
+    3. Extract the log-probability that the model assigns to each
+       token of c given the preceding context
+    4. Sum the token log-probs to get log P(c | prompt)
+
+  This gives us a vector of log-probs: [log P(c1|prompt), ..., log P(ck|prompt)]
+  Apply softmax to get a proper probability distribution over classes.
+
+Why this approach is correct for multi-token answers:
+  - The answer "walking_up" is tokenized to multiple tokens
+  - A simpler approach (look at only the first generated token)
+    would confuse "walking", "walking_up", and "walking_down" since
+    they all start with the same "walk" token
+  - Teacher-forced scoring sums over ALL tokens of each candidate,
+    so it correctly distinguishes them
+
+Cost: one batched forward pass per (sample, noise realization),
+      where the batch size equals the number of answer classes.
+  - For HAR with 8 classes and N=50: 51 forward passes of batch size 8
+  - For Sleep with 6 classes and N=50: 51 forward passes of batch size 6
+
+This is efficient enough to run on a single GPU overnight for
+a full test set.
+
+
+----------------------------------------------------------------
+5. WHAT WAS BUILT (FILE BY FILE)
+----------------------------------------------------------------
+
+These are all inside UncertaintyInOpenTSLM/ (this repository):
+
+--- New files ---
+
+src/opentslm/uncertainty/__init__.py
+  Empty Python package marker.  Makes the uncertainty/ directory
+  importable as opentslm.uncertainty.
+
+src/opentslm/uncertainty/mcspu.py
+  The core library.  Contains two things:
+
+  add_additive_noise(sample, sigma, rng=None)
+    Takes a sample dict, deep-copies it, adds Gaussian noise
+    eps ~ N(0, sigma^2) to each channel in sample["time_series"].
+    Does NOT touch time_series_text (the mean/std description text).
+    Returns the noisy copy; the original is never modified.
+    Works whether time_series is a List[List[float]] (before collation)
+    or a torch.Tensor (after collation).
+
+  MCSpUScorer class
+    __init__(model, answer_vocab, n_samples=50, sigma=1.0, seed=None)
+      model        : a loaded OpenTSLMSP or OpenTSLMFlamingo instance
+      answer_vocab : list of candidate answer strings, e.g.
+                     ["biking","lying","running","sitting",
+                      "standing","walking","walking_down","walking_up"]
+      n_samples    : N noise realizations (default 50)
+      sigma        : noise standard deviation (default 1.0)
+      seed         : for reproducibility
+
+    score_sample(sample, answer_vocab_override=None) -> dict
+      Runs the full MCSPU computation for one sample.
+      Returns: mcspu_score, clean_probs, clean_pred, per_noise_kl,
+               sigma, n_samples, answer_vocab
+
+    score_dataset(dataset, max_samples=None) -> List[dict]
+      Calls score_sample for every item in the dataset.
+      Adds sample_idx and ground_truth to each result.
+      Prints progress every 10 samples.
+
+compute_mcspu.py  (in the repository root, same level as curriculum_learning.py)
+  Command-line script to run MCSPU on a trained checkpoint.
+  See Section 7 (Usage) for the full argument list.
+
+test/test_mcspu.py
+  22 unit tests that run WITHOUT any GPU or trained checkpoint.
+  Uses mock model objects.  Tests:
+    - add_additive_noise is truly additive (not replacement)
+    - time_series_text is NOT changed by noise injection
+    - original sample is not mutated
+    - KL divergence is non-negative
+    - A deterministic mock model gives KL ~= 0
+    - per-sample vocab override works
+
+--- Modified files ---
+
+src/opentslm/model/llm/TimeSeriesLLM.py
+  Added abstract method:
+    compute_class_logprobs(self, sample, answer_vocab) -> torch.Tensor
+  This is the interface that MCSpUScorer calls.  Both model types
+  must implement it.
+
+src/opentslm/model/llm/OpenTSLMSP.py  (the Soft Prompt model)
+  Implemented compute_class_logprobs:
+    1. Encode the prompt ONCE (batch of 1)
+    2. Tile the prompt embeddings B times (B = len(answer_vocab))
+    3. Tokenize all B candidate answers
+    4. Embed the answers and concatenate after the prompt
+    5. One forward pass with batch size B
+    6. Slice the logits at answer positions (shift-by-1 alignment)
+    7. Gather log-probs for each candidate's actual tokens
+    8. Sum over tokens → log P(candidate | prompt) for each class
+
+src/opentslm/model/llm/OpenTSLMFlamingo.py  (the Flamingo model)
+  Implemented compute_class_logprobs:
+    1. Build batch of B copies (each with a different answer string)
+    2. Call pad_and_apply_batch(batch, include_labels=False)
+       This returns (input_ids, images, attention_mask, labels)
+       where labels = -100 at prompt positions, real token IDs
+       at answer positions
+    3. Forward pass WITHOUT labels (so we get logits, not loss)
+    4. Shift-by-1 alignment on logits
+    5. Use the labels mask to identify answer token positions
+    6. Gather and sum log-probs over answer positions
+
+test/smoke_test.py
+  Added "opentslm.uncertainty.mcspu" to the import list so it is
+  checked on every CI run.
+
+
+----------------------------------------------------------------
+6. RELATIONSHIP TO THE UPSTREAM GITHUB
+----------------------------------------------------------------
+
+This repository is a FORK of github.com/StanfordBDHG/OpenTSLM.
+
+The upstream repo contains:
+  - The two model architectures (OpenTSLMSP, OpenTSLMFlamingo)
+  - 5 curriculum training stages (TSQA, M4, HAR, Sleep, ECG QA)
+  - Dataset loaders for each task
+  - Evaluation scripts under evaluation/
+
+This fork ADDS (on top of upstream, without modifying its logic):
+
+  From the upstream codebase (already present when you cloned):
+    - NoiseInjectionMixin (src/.../noise_mixin.py)
+        Dataset-level flag to REPLACE signals with noise entirely.
+        This is the "Tony" noise injection referenced in the research idea.
+    - SignalContributionTracker (inside OpenTSLMFlamingo.py)
+        Forward hooks measuring how much the cross-attention gates
+        actually let ECG signal through.
+    - measure_signal_contribution.py (root)
+        CLI script using the SignalContributionTracker.
+    - test_noise_injection.py (root)
+        Verifies that the dataset-level noise injection works.
+
+  What THIS work adds:
+    - src/opentslm/uncertainty/mcspu.py
+        Per-sample ADDITIVE noise uncertainty scoring (new concept).
+    - compute_mcspu.py
+        CLI to run MCSPU on a trained checkpoint.
+    - compute_class_logprobs on both model classes
+        New inference method needed for probability extraction.
+
+The MCSPU approach is COMPLEMENTARY to SignalContributionTracker:
+  - SignalContributionTracker measures how open the cross-attention
+    gates are (internal model property, activation magnitudes)
+  - MCSPU measures sensitivity of the OUTPUT distribution to
+    signal perturbations (external behaviour, information-theoretic)
+
+Together they give two different angles on the same question:
+"Does the signal actually matter for this prediction?"
+
+
+----------------------------------------------------------------
+7. WHERE .PT CHECKPOINTS COME FROM
+----------------------------------------------------------------
+
+You do NOT have any .pt files yet.  They are produced by training.
+
+The training pipeline is curriculum_learning.py.  It runs 5 stages
+sequentially, each stage loading the best checkpoint from the
+previous stage:
+
+  Stage 1 (MCQ):        python curriculum_learning.py --model OpenTSLMFlamingo --stages stage1_mcq
+  Stage 2 (Captioning): python curriculum_learning.py --model OpenTSLMFlamingo --stages stage2_captioning
+  Stage 3 (HAR CoT):    python curriculum_learning.py --model OpenTSLMFlamingo --stages stage3_cot
+  Stage 4 (Sleep CoT):  python curriculum_learning.py --model OpenTSLMFlamingo --stages stage4_sleep_cot
+  Stage 5 (ECG CoT):    python curriculum_learning.py --model OpenTSLMFlamingo --stages stage5_ecg_cot
+
+Or run all stages at once:
+  python curriculum_learning.py --model OpenTSLMFlamingo
+
+Checkpoints are saved to:
+  results/{llm_id}/{model_type}/{stage_name}/checkpoints/best_model.pt
+
+For example:
+  results/Llama3_2_1B/OpenTSLMFlamingo/stage3_cot/checkpoints/best_model.pt
+
+Alternatively, pretrained checkpoints are available on HuggingFace
+under the OpenTSLM organization:
+  https://huggingface.co/OpenTSLM
+
+You can load them directly with OpenTSLM.load_pretrained():
+  from opentslm import OpenTSLM
+  model = OpenTSLM.load_pretrained("OpenTSLM/llama-3.2-1b-har-flamingo")
+
+HOWEVER: the load_pretrained() factory method returns a model but
+does NOT save a local .pt file.  The compute_mcspu.py CLI expects
+a local .pt path.  When using pretrained HuggingFace checkpoints,
+use the demo scripts in demo/huggingface/ for quick tests, or save
+the loaded model to disk first:
+  model.store_to_file("my_har_model.pt")
+
+For the experiments described in the research proposal, you should
+train your own checkpoints (so you can verify training dynamics and
+have full control over the training data split used for calibration).
+
+
+----------------------------------------------------------------
+8. FULL USAGE ONCE YOU HAVE A CHECKPOINT
+----------------------------------------------------------------
+
+Step 1: Train a model (example: HAR stage only, Flamingo)
+  python curriculum_learning.py \
+    --model OpenTSLMFlamingo \
+    --stages stage1_mcq stage3_cot \
+    --device cuda
+
+  (Stage 3 requires Stage 1 to complete first so the encoder is
+   pre-trained on the MCQ task.  Or run all 5 stages sequentially.)
+
+  Checkpoint will be at:
+    results/Llama3_2_1B/OpenTSLMFlamingo/stage3_cot/checkpoints/best_model.pt
+
+Step 2: Run MCSPU on the HAR test set
+  python compute_mcspu.py \
+    --checkpoint results/Llama3_2_1B/OpenTSLMFlamingo/stage3_cot/checkpoints/best_model.pt \
+    --model_type flamingo \
+    --dataset har \
+    --n_samples 50 \
+    --sigma 1.0 \
+    --output mcspu_har.jsonl
+
+  This will print progress and a summary table, then write one JSON
+  line per test sample to mcspu_har.jsonl.
+
+Step 3: Do the same for ECG (expect LOW MCSPU scores — model ignores signal)
+  python compute_mcspu.py \
+    --checkpoint results/Llama3_2_1B/OpenTSLMFlamingo/stage5_ecg_cot/checkpoints/best_model.pt \
+    --model_type flamingo \
+    --dataset ecg_qa \
+    --n_samples 50 \
+    --sigma 1.0 \
+    --output mcspu_ecg.jsonl
+
+Step 4: Compare results
+  HAR should have high mean MCSPU scores.
+  ECG should have low mean MCSPU scores.
+  This is the per-sample confirmation of the population-level finding
+  from the upstream paper.
+
+Step 5: Vary sigma to sweep noise strength
+  --sigma 0.1   (very small perturbation)
+  --sigma 0.5
+  --sigma 1.0   (default: comparable to signal std after normalization)
+  --sigma 2.0   (large perturbation)
+
+  A model that truly uses the signal should show MCSPU increasing
+  with sigma.  A model that ignores the signal should have MCSPU
+  near 0 regardless of sigma.
+
+Quick test with pretrained HF model (no training needed):
+  # First run a demo script to download the checkpoint
+  python demo/huggingface/03_test_hf_har_cot.py
+
+  # In Python, load and save the model:
+  from opentslm import OpenTSLM
+  m = OpenTSLM.load_pretrained("OpenTSLM/llama-3.2-1b-har-flamingo", device="cpu")
+  m.store_to_file("har_pretrained.pt")
+
+  # Then run MCSPU
+  python compute_mcspu.py \
+    --checkpoint models/har_pretrained.pt \
+    --model_type flamingo \
+    --dataset har \
+    --n_samples 5 \
+    --max_samples 10 \
+    --device cpu \
+    --output /tmp/mcspu_smoke.jsonl
+
+----------------------------------------------------------------
+9. OUTPUT FORMAT
+----------------------------------------------------------------
+
+compute_mcspu.py writes one JSON line per sample:
+
+{
+  "sample_idx": 42,
+  "ground_truth": "walking",
+  "clean_pred": "walking",
+  "mcspu_score": 0.312,
+  "clean_probs": [0.01, 0.02, 0.03, 0.04, 0.05, 0.82, 0.02, 0.01],
+  "clean_logprobs": [-12.3, -11.8, ...],
+  "per_noise_kl": [0.28, 0.31, 0.35, ...],
+  "sigma": 1.0,
+  "n_samples": 50,
+  "answer_vocab": ["biking","lying","running","sitting","standing",
+                   "walking","walking_down","walking_up"],
+  "checkpoint": "results/.../best_model.pt",
+  "dataset": "har",
+  "split": "test",
+  "llm_id": "meta-llama/Llama-3.2-1B",
+  "model_type": "flamingo"
+}
+
+Fields:
+  mcspu_score   The main result: mean KL divergence U_signal.
+                High = model uses signal.  Low = model ignores signal.
+  clean_probs   Softmax probabilities over answer classes for the
+                REAL (unperturbed) signal.
+  clean_pred    Argmax class on the clean signal (model's prediction).
+  per_noise_kl  The N individual KL values (one per noise draw).
+                mcspu_score = mean(per_noise_kl).
+  ground_truth  The correct answer from the dataset.
+
+
+----------------------------------------------------------------
+10. NEXT STEPS (FROM THE RESEARCH PROPOSAL)
+----------------------------------------------------------------
+
+MCSPU is Step 1 of the research plan in research_idea_uncertainty_opentslm.txt.
+
+After MCSPU scores are computed:
+
+Step 2: Conformal prediction wrappers
+  Use the validation set to calibrate prediction sets:
+    C_alpha(x) = { c : nonconformity_score(c, x) <= quantile }
+  The SET SIZE is a calibrated uncertainty certificate.
+
+Step 3: Signal-conditional conformal
+  Use the MCSPU score to inflate the nonconformity score:
+    s_signal(x, c) = -p_clean(c) + lambda * mcspu_score(x)
+  Samples with high MCSPU get wider prediction sets.
+
+Step 4: Uncertainty decomposition
+  H_total  = entropy of p_clean(y | x_s, x_t)
+  H_signal = E_eps[ entropy of p(y | x_s + eps, x_t) ] - H_total
+  H_task   = entropy of p(y | pure_noise, x_t)
+
+  H_total ~= H_task + H_signal
+
+  This decomposes per-sample uncertainty into:
+    signal-driven (signal is ambiguous)
+    task-driven   (the question is inherently hard)
+
+================================================================

@@ -1,0 +1,198 @@
+================================================================
+UNCERTAINTY DECOMPOSITION FOR TIME SERIES LLMs
+Building on Tony's noise injection experiments (OpenTSLM fork)
+================================================================
+
+MOTIVATION
+----------
+Tony's noise injection framework answers: "does the model rely on the signal?"
+by swapping the real signal with noise and checking if accuracy drops.
+
+The problem: this is a binary, population-level test. It doesn't tell us:
+  (a) how uncertain the model is on a *specific* sample
+  (b) whether uncertainty comes from the signal being ambiguous
+      or from the task being inherently hard
+
+The ECG anomaly (accuracy ~0.4 regardless of noise type) is the key clue:
+the model isn't extracting information from the ECG signal at all —
+it's collapsing to some prior. A good uncertainty framework should detect
+this *automatically*, per sample, without knowing the ground truth.
+
+
+CORE MATHEMATICAL IDEA
+-----------------------
+
+Let x_s = time series signal, x_t = text prompt, y = model output token(s).
+
+The model computes: p(y | x_s, x_t)   [the OpenTSLM forward pass]
+
+Tony's approach: compare p(y | x_s, x_t) vs p(y | ε, x_t)  where ε ~ noise
+This gives a scalar accuracy gap — a population-level measure.
+
+We want a per-sample uncertainty score that is *responsive* to signal quality.
+
+
+-- Step 1: Monte Carlo Signal Perturbation Uncertainty (MCSPU) --
+
+Draw N noise realizations: ε_1, ..., ε_N  iid from p(ε)
+
+For each, run inference:  ŷ_i = argmax p(y | x_s + ε_i, x_t)
+
+Signal Uncertainty Score:
+  U_signal(x) = (1/N) * Σ_i  D( p(y|x_s, x_t) || p(y|x_s + ε_i, x_t) )
+
+where D is KL divergence or total variation distance.
+
+Intuition:
+  - High U_signal → model's output distribution shifts a lot when signal is
+    perturbed → model is relying on (and sensitive to) the signal
+  - Low U_signal → model ignores the signal, output is driven by x_t or prior
+
+
+-- Step 2: Conformal Prediction for Valid Uncertainty Certificates --
+
+Standard conformal prediction (Venn-Abers / RAPS):
+
+Given a calibration set {(x_i, y_i)}_{i=1}^n, define a nonconformity score:
+  s_i = -p(y_i | x_s_i, x_t_i)       [negative predicted probability of true label]
+
+For a new test point at coverage level 1-α:
+  ŷ_set = { c : s_test(c) <= q̂_{1-α} }
+
+where q̂_{1-α} is the (1-α)(1 + 1/n)-th quantile of {s_1,...,s_n}.
+
+Guarantee: P(y_test ∈ ŷ_set) >= 1-α   [finite-sample, distribution-free]
+
+Key: the SIZE of ŷ_set is a calibrated uncertainty measure.
+  |ŷ_set| = 1 → model is confident
+  |ŷ_set| = K → model is uncertain (K classes all plausible)
+
+
+-- Step 3: Signal-Conditional Conformal Scores --
+
+Replace the standard nonconformity score with a signal-aware version:
+
+  s_i^signal = -p(y_i | x_s_i, x_t_i) + λ * U_signal(x_i)
+
+This inflates the nonconformity score when the model is sensitive to
+signal perturbations, producing *larger* prediction sets for samples where
+signal quality drives uncertainty.
+
+Alternatively, stratify the calibration set by signal uncertainty quantile:
+  - Low U_signal samples → tight prediction sets (model uses text/prior)
+  - High U_signal samples → wider prediction sets (model relies on signal)
+
+
+-- Step 4: Uncertainty Decomposition --
+
+Total predictive uncertainty (entropy):
+  H[y | x_s, x_t] = -Σ_c p(y=c|x_s,x_t) log p(y=c|x_s,x_t)
+
+Signal-induced uncertainty (via perturbation):
+  H_signal = E_{ε}[ H[y | x_s + ε, x_t] ] - H[y | x_s, x_t]
+  (how much entropy increases when we degrade the signal)
+
+Residual (task/text) uncertainty:
+  H_task = H[y | ε, x_t]      [run with pure noise — baseline without signal]
+
+Decomposition:
+  H_total ≈ H_task + H_signal
+
+This gives a per-sample answer to: "is the model uncertain because the
+ECG is ambiguous, or because this QA question is inherently hard?"
+
+
+EXPERIMENTAL PLAN
+-----------------
+
+1. Baseline: reproduce Tony's accuracy-gap results on all 5 stages
+   (TSQA, M4, HAR CoT, Sleep CoT, ECG QA)
+
+2. MCSPU scores: compute U_signal for each test sample, N=50 noise draws
+   Noise types: Gaussian(0, σ) for σ ∈ {0.1, 0.5, 1.0, 2.0}
+
+3. Conformal calibration: use val set → compute prediction set sizes
+   at α=0.1 (90% coverage)
+
+4. Signal-conditional conformal: stratify by U_signal quartile
+   → show prediction set size increases with signal sensitivity
+
+5. Decomposition: compare H_total, H_signal, H_task across tasks
+   Expected: ECG should show H_signal ≈ 0 (model doesn't use signal)
+             HAR/Sleep should show H_signal > 0 (signal matters)
+
+6. Calibration curves (reliability diagrams): is the model well-calibrated
+   on samples with high vs low signal uncertainty?
+
+
+WHY CONFORMAL OVER BAYESIAN METHODS
+-------------------------------------
+- No retraining, no weight uncertainty, works with any black-box model
+- Finite-sample coverage guarantee: P(y ∈ ŷ_set) >= 1-α exactly
+- Bayesian methods (MC Dropout, Laplace) require architectural changes
+  and only give asymptotic guarantees
+- Scales to LLM-sized models without storing weight posteriors
+
+
+TOOLS / CODE NEEDED
+--------------------
+- Tony's NoiseInjectionMixin is already the core of Step 1
+- Need: multi-sample inference loop (N forward passes per test sample)
+- Need: conformal calibration wrapper on top of existing eval scripts
+- Libraries: no new ones — torch, numpy, existing OpenTSLM dataset classes
+
+
+ONE-LINE FOR THE BOSS
+---------------------
+"Tony showed the model uses the signal for 3/5 tasks; I want to build a
+per-sample uncertainty score that quantifies *how much* it relies on the
+signal, with formal coverage guarantees from conformal prediction."
+
+
+================================================================
+CONNECTION TO PROBABILISTIC & GENERATIVE AI COURSE PROJECT
+================================================================
+
+The course project builds a "mini LLM for time series" using:
+  xₜ ~ Categorical(p₁, ..., p₁₂₈)   [128-bin discretization]
+
+OpenTSLM does the same thing at a higher level:
+  - patch-based CNN tokenizes the signal into a sequence of embeddings
+  - LLM predicts next token (text or class label) given signal tokens
+  - cross-entropy loss during training is the same objective
+
+DIRECT OVERLAPS:
+
+1. Discrete uncertainty representation
+   Course: Categorical output over 128 bins → richer than Gaussian
+   Research: conformal prediction sets over output classes → same idea,
+   applied to measuring uncertainty rather than just making predictions
+
+2. Temperature sampling (course bonus section)
+   T → 0 : argmax (confident, mode)
+   T → ∞ : uniform (maximally uncertain)
+   Temperature directly controls H[y] — connects to uncertainty decomposition
+
+3. Quantile binning (course bonus)
+   Adaptive bin widths = non-uniform discretization
+   Research: could use quantile-based signal perturbation instead of
+   additive Gaussian — perturb to adjacent quantile bins
+
+4. Sampling vs expected-value predictions (course evaluation)
+   Course: compare E[x̂] vs sampled x̂
+   Research: same tradeoff — conformal prediction set vs point estimate
+
+POSSIBLE COURSE PROJECT EXTENSION:
+Add a section comparing:
+  (a) Gaussian model uncertainty (σ² output)
+  (b) Discrete model uncertainty (entropy of Categorical)
+  (c) Conformal prediction set size as a calibrated certificate
+
+This would directly satisfy the course's "compare continuous vs discrete
+uncertainty representations" objective while also piloting the methodology
+you'd apply to OpenTSLM.
+
+The ETTh1 dataset in the course project is a standard forecasting benchmark.
+You could reproduce the discrete tokenization on a small ECG or HAR segment
+to show the same machinery works for medical signals — connecting both projects.
+================================================================

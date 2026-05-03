@@ -117,7 +117,8 @@ def _add_noise(sample: Dict[str, Any], sigma: float, rng: np.random.Generator) -
 
 def _kl(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-10) -> float:
     p, q = p.float(), q.float()
-    return float(torch.sum(p * (torch.log(p + eps) - torch.log(q + eps))).item())
+    # clamp: fp32 arithmetic can produce tiny negatives (~1e-7) that aren't real
+    return float(max(0.0, torch.sum(p * (torch.log(p + eps) - torch.log(q + eps))).item()))
 
 
 def _get_logprobs(model, sample: Dict[str, Any], vocab: List[str],
@@ -543,8 +544,9 @@ def plot_test_metrics(reports, sigma_lo, sigma_hi, out_dir):
         metrics = [r.sensitivity[col].metric for r in reports]
         passed = [r.sensitivity[col].passed for r in reports]
         colours = [PALETTE[r.label] for r in reports]
-        ax.bar(range(len(reports)), metrics, color=colours,
-               alpha=[0.9 if p else 0.5 for p in passed])
+        bars = ax.bar(range(len(reports)), metrics, color=colours)
+        for bar, p in zip(bars, passed):
+            bar.set_alpha(0.9 if p else 0.5)
         ax.axhline(t0.threshold, color="black", linewidth=1.5,
                    linestyle="--", label=f"threshold={t0.threshold}")
         ax.set_xticks(range(len(reports)))

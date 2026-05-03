@@ -23,6 +23,8 @@ Usage:
     python uncertainty_test.py --results_dir mcspu_results --out_dir plots
 """
 
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import argparse
 import json
 import sys
@@ -35,8 +37,6 @@ from scipy import stats
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 
 # ---------------------------------------------------------------------------
 # Dataset registry
@@ -88,6 +88,7 @@ THRESHOLDS = {
 # Data structures
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class TestResult:
     name: str
@@ -127,6 +128,7 @@ class DatasetReport:
 # Data loading
 # ---------------------------------------------------------------------------
 
+
 def load_stage(results_dir: Path, stage_key: str) -> Optional[dict]:
     """Returns {sigma: [records]} or None if data is missing."""
     stage_dir = results_dir / stage_key
@@ -137,7 +139,8 @@ def load_stage(results_dir: Path, stage_key: str) -> Optional[dict]:
         path = stage_dir / f"sigma_{sigma}.jsonl"
         if not path.exists():
             continue
-        data[sigma] = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+        data[sigma] = [json.loads(l)
+                       for l in path.read_text().splitlines() if l.strip()]
     return data if data else None
 
 
@@ -226,8 +229,10 @@ def _cohens_d(a: np.ndarray, b: np.ndarray) -> float:
 def _run_sensitivity(sigma_data: dict) -> List[TestResult]:
     results = []
 
-    scores_lo = np.array([r["mcspu_score"] for r in sigma_data.get(SIGMA_LO, [])])
-    scores_hi = np.array([r["mcspu_score"] for r in sigma_data.get(SIGMA_HI, [])])
+    scores_lo = np.array([r["mcspu_score"]
+                         for r in sigma_data.get(SIGMA_LO, [])])
+    scores_hi = np.array([r["mcspu_score"]
+                         for r in sigma_data.get(SIGMA_HI, [])])
 
     if len(scores_lo) == 0 or len(scores_hi) == 0:
         return results
@@ -260,7 +265,8 @@ def _run_sensitivity(sigma_data: dict) -> List[TestResult]:
 
     # 3. Statistical significance — one-sided Mann-Whitney U
     #    H₁: MCSPU scores at σ_hi are stochastically greater than at σ_lo
-    u_stat, p_val = stats.mannwhitneyu(scores_hi, scores_lo, alternative="greater")
+    u_stat, p_val = stats.mannwhitneyu(
+        scores_hi, scores_lo, alternative="greater")
     thr = THRESHOLDS["max_mannwhitney_p"]
     results.append(TestResult(
         name="statistical_significance",
@@ -292,11 +298,11 @@ def _run_sensitivity(sigma_data: dict) -> List[TestResult]:
 # Terminal report
 # ---------------------------------------------------------------------------
 
-_GREEN  = "\033[92m"
-_RED    = "\033[91m"
+_GREEN = "\033[92m"
+_RED = "\033[91m"
 _YELLOW = "\033[93m"
-_RESET  = "\033[0m"
-_BOLD   = "\033[1m"
+_RESET = "\033[0m"
+_BOLD = "\033[1m"
 
 
 def _colored(text: str, color: str) -> str:
@@ -327,12 +333,15 @@ def print_report(reports: List[DatasetReport]) -> int:
 
     for i, name in enumerate(sanity_names):
         row = f"  {name:{col_w}s}  "
-        row += "  ".join(f"{_pass_str(r.sanity[i].passed):>10}" for r in reports)
+        row += "  ".join(
+            f"{_pass_str(r.sanity[i].passed):>10}" for r in reports)
         print(row)
 
     # ── Sensitivity tests table ─────────────────────────────────────────────
-    sensitivity_names = [t.name for t in reports[0].sensitivity] if reports else []
-    col_w2 = max(len(n) for n in sensitivity_names) + 2 if sensitivity_names else 30
+    sensitivity_names = [
+        t.name for t in reports[0].sensitivity] if reports else []
+    col_w2 = max(len(n) for n in sensitivity_names) + \
+        2 if sensitivity_names else 30
     print(f"\n{_BOLD}SIGNAL SENSITIVITY TESTS{_RESET}")
     print(f"  Expected to PASS: TSQA, HAR, Sleep EDF  |  Expected to FAIL: ECG-QA")
     print(f"  {'Test':{col_w2}s}  {header_cols}")
@@ -340,7 +349,8 @@ def print_report(reports: List[DatasetReport]) -> int:
 
     for i, name in enumerate(sensitivity_names):
         row = f"  {name:{col_w2}s}  "
-        row += "  ".join(f"{_pass_str(r.sensitivity[i].passed):>10}" for r in reports)
+        row += "  ".join(
+            f"{_pass_str(r.sensitivity[i].passed):>10}" for r in reports)
         print(row)
 
     # ── Threshold reference ─────────────────────────────────────────────────
@@ -353,9 +363,11 @@ def print_report(reports: List[DatasetReport]) -> int:
 
     # ── Per-model metric table ──────────────────────────────────────────────
     print(f"\n{'─'*70}")
-    print(f"{'Metric values at σ={lo} vs σ={hi}':}".format(lo=SIGMA_LO, hi=SIGMA_HI))
+    print(f"{'Metric values at σ={lo} vs σ={hi}':}".format(
+        lo=SIGMA_LO, hi=SIGMA_HI))
     print(f"{'─'*70}")
-    header = f"  {'Metric':<30}  " + "  ".join(f"{r.label:>10}" for r in reports)
+    header = f"  {'Metric':<30}  " + \
+        "  ".join(f"{r.label:>10}" for r in reports)
     print(header)
     for i, name in enumerate(sensitivity_names):
         vals = "  ".join(f"{r.sensitivity[i].metric:>10.4f}" for r in reports)
@@ -379,7 +391,7 @@ def print_report(reports: List[DatasetReport]) -> int:
 
         uses = r.sensitivity_passed()
         signal_str = (
-            _colored("USES SIGNAL",    _GREEN)  if uses else
+            _colored("USES SIGNAL",    _GREEN) if uses else
             _colored("IGNORES SIGNAL", _RED)
         )
         print(f"  {r.label:<12}  {signal_str:<30}  {verdict}")
@@ -388,7 +400,8 @@ def print_report(reports: List[DatasetReport]) -> int:
     if unexpected == 0:
         print(_colored("  All outcomes match expectations.  Exit 0.", _GREEN))
     else:
-        print(_colored(f"  {unexpected} unexpected outcome(s).  Exit 1.", _RED))
+        print(
+            _colored(f"  {unexpected} unexpected outcome(s).  Exit 1.", _RED))
     print()
 
     return 1 if unexpected > 0 else 0
@@ -422,14 +435,14 @@ def _plot_test_results(reports: List[DatasetReport], out_dir: Path):
     Sanity tests and signal sensitivity tests in two row groups.
     Green = PASS, red = FAIL, with cell annotations.
     """
-    all_tests   = [("sanity", t) for t in reports[0].sanity] + \
-                  [("sensitivity", t) for t in reports[0].sensitivity]
+    all_tests = [("sanity", t) for t in reports[0].sanity] + \
+        [("sensitivity", t) for t in reports[0].sensitivity]
     test_labels = [t.name.replace("_", "\n") for _, t in all_tests]
-    ds_labels   = [r.label for r in reports]
-    n_tests     = len(all_tests)
-    n_ds        = len(ds_labels)
+    ds_labels = [r.label for r in reports]
+    n_tests = len(all_tests)
+    n_ds = len(ds_labels)
 
-    matrix  = np.zeros((n_tests, n_ds))
+    matrix = np.zeros((n_tests, n_ds))
     for j, rep in enumerate(reports):
         for i, (cat, _) in enumerate(all_tests):
             tests = rep.sanity if cat == "sanity" else rep.sensitivity
@@ -482,22 +495,23 @@ def _plot_sensitivity_metrics(reports: List[DatasetReport], out_dir: Path):
     for col, test_idx in enumerate(range(n)):
         ax = axes[col]
         test_name = reports[0].sensitivity[test_idx].name
-        thr       = reports[0].sensitivity[test_idx].threshold
-        op        = reports[0].sensitivity[test_idx].op
-        unit      = reports[0].sensitivity[test_idx].unit
+        thr = reports[0].sensitivity[test_idx].threshold
+        op = reports[0].sensitivity[test_idx].op
+        unit = reports[0].sensitivity[test_idx].unit
 
-        labels  = [r.label for r in reports]
+        labels = [r.label for r in reports]
         metrics = [r.sensitivity[test_idx].metric for r in reports]
-        passed  = [r.sensitivity[test_idx].passed  for r in reports]
+        passed = [r.sensitivity[test_idx].passed for r in reports]
         colours = [PALETTE[l] for l in labels]
-        alphas  = [0.9 if p else 0.5 for p in passed]
+        alphas = [0.9 if p else 0.5 for p in passed]
 
         bars = ax.bar(range(len(labels)), metrics, color=colours, alpha=0.85)
         for bar, alpha in zip(bars, alphas):
             bar.set_alpha(alpha)
 
         # threshold line
-        ax.axhline(thr, color="black", linewidth=1.5, linestyle="--", label=f"threshold ({thr})")
+        ax.axhline(thr, color="black", linewidth=1.5,
+                   linestyle="--", label=f"threshold ({thr})")
 
         ax.set_xticks(range(len(labels)))
         ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9)
@@ -543,7 +557,7 @@ def _plot_sigma_sweep(reports: List[DatasetReport],
         xs, ys, cis = np.array(xs), np.array(ys), np.array(cis)
         verdict = "USES SIGNAL" if rep.sensitivity_passed() else "IGNORES SIGNAL"
         linestyle = "-" if rep.sensitivity_passed() else "--"
-        ax.plot(xs, ys, marker="o", label=f"{rep.label}  [{verdict}]",
+        ax.plot(xs, ys, marker="o", label=f"{verdict}",
                 color=colour, linewidth=2, linestyle=linestyle)
         ax.fill_between(xs, ys - cis, ys + cis, alpha=0.12, color=colour)
 
@@ -568,7 +582,8 @@ def _save(fig, stem: Path):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="MCSPU uncertainty test suite")
+    parser = argparse.ArgumentParser(
+        description="MCSPU uncertainty test suite")
     parser.add_argument("--results_dir", default="mcspu_results", type=Path)
     parser.add_argument("--out_dir",     default="plots",         type=Path)
     args = parser.parse_args()
@@ -588,7 +603,8 @@ def main():
             continue
         sigma_data_all[stage_key] = sdata
         n_samples = sum(len(v) for v in sdata.values())
-        print(f"  {meta['label']:<12}  {len(sdata)} sigma files  ({n_samples} total records)")
+        print(
+            f"  {meta['label']:<12}  {len(sdata)} sigma files  ({n_samples} total records)")
 
         report = DatasetReport(
             stage_key=stage_key,

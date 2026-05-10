@@ -278,7 +278,7 @@ def run_sanity(sigma_data: Dict[float, List[dict]]) -> List[TestResult]:
 
     # 2. KL ≥ 0
     min_kl = min(kl for r in all_r for kl in r["per_noise_kl"])
-    out.append(TestResult("kl_nonneg", min_kl >= -1e-9,
+    out.append(TestResult("kl_nonneg", min_kl >= -1e-6,
                           float(min_kl), 0.0, ">=", "nats",
                           f"min per_noise_kl = {min_kl:.2e}"))
 

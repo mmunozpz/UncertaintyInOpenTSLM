@@ -112,13 +112,12 @@ def _load_dataset(args, model):
 # Summary printing
 # ---------------------------------------------------------------------------
 
-def _print_summary(results: list[dict], args) -> None:
+def _print_summary(results: list[dict], args, level_label: str = "") -> None:
     scores = [r["mcspu_score"] for r in results]
     correct = sum(1 for r in results if r.get("clean_pred") == r.get("ground_truth"))
     n = len(results)
     accuracy = correct / n if n else float("nan")
 
-    # Correlation between MCSPU score and model uncertainty (1 - max clean prob)
     confidences = [max(r["clean_probs"]) for r in results]
     uncertainties = [1.0 - c for c in confidences]
     try:
@@ -127,13 +126,17 @@ def _print_summary(results: list[dict], args) -> None:
         corr = float("nan")
 
     print("\n" + "=" * 60)
-    print("MCSPU SUMMARY")
+    print("MCSPU SUMMARY" + (f"  [{level_label}]" if level_label else ""))
     print("=" * 60)
     print(f"  Samples scored:       {n}")
     print(f"  Dataset:              {args.dataset} ({args.split})")
     print(f"  Model:                {args.model_type} / {args.llm_id}")
-    print(f"  Noise sigma:          {args.sigma}")
-    print(f"  N noise realizations: {args.n_samples}")
+    print(f"  Perturbation type:    {args.perturbation_type}")
+    if args.perturbation_type == "gaussian":
+        print(f"  Noise sigma:          {args.sigma}")
+    else:
+        print(f"  Missing fraction:     {level_label or args.missing_fractions}")
+    print(f"  N realizations:       {args.n_samples}")
     print(f"  Mean MCSPU score:     {np.mean(scores):.4f}")
     print(f"  Std  MCSPU score:     {np.std(scores):.4f}")
     print(f"  Clean accuracy:       {accuracy:.4f}  ({correct}/{n})")
@@ -172,11 +175,23 @@ def main():
     )
     parser.add_argument(
         "--n_samples", type=int, default=50,
-        help="Number of noise realizations N (default: 50)"
+        help="Number of perturbation draws N per sample (default: 50)"
+    )
+    # gaussian args
+    parser.add_argument(
+        "--perturbation_type", default="gaussian", choices=["gaussian", "missing"],
+        help="Perturbation type: gaussian (additive noise) or missing (random timepoint masking)"
     )
     parser.add_argument(
         "--sigma", type=float, default=1.0,
-        help="Additive noise std deviation (default: 1.0)"
+        help="[gaussian] Additive noise std deviation (default: 1.0)"
+    )
+    # missing data args
+    parser.add_argument(
+        "--missing_fractions", type=float, nargs="+",
+        default=[0.1, 0.25, 0.5, 0.75, 1.0],
+        help="[missing] Fraction(s) of timepoints to zero per channel. "
+             "Multiple values sweep all levels in one run. (default: 0.1 0.25 0.5 0.75 1.0)"
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -211,37 +226,57 @@ def main():
             "Supply --answer_vocab."
         )
 
-    # MCSpUScorer uses answer_vocab as the default; ECG QA overrides per-sample.
     from opentslm.uncertainty.mcspu import MCSpUScorer
-    scorer = MCSpUScorer(
-        model=model,
-        answer_vocab=answer_vocab or [],  # ECG QA uses per-sample override
-        n_samples=args.n_samples,
-        sigma=args.sigma,
-        seed=args.seed,
-        class_batch_size=args.class_batch_size,
-    )
 
-    print(f"Scoring {args.dataset} {args.split} split "
-          f"(N={args.n_samples}, sigma={args.sigma}) ...")
+    all_results: list[dict] = []
 
-    results = scorer.score_dataset(dataset, max_samples=args.max_samples)
+    if args.perturbation_type == "gaussian":
+        levels = [args.sigma]
+    else:
+        levels = sorted(args.missing_fractions)
 
-    # Attach provenance fields to each record
-    for r in results:
-        r["checkpoint"] = args.checkpoint
-        r["dataset"] = args.dataset
-        r["split"] = args.split
-        r["llm_id"] = args.llm_id
-        r["model_type"] = args.model_type
+    for level in levels:
+        if args.perturbation_type == "gaussian":
+            print(f"\nScoring {args.dataset} {args.split} — gaussian σ={level}  N={args.n_samples} ...")
+            scorer = MCSpUScorer(
+                model=model,
+                answer_vocab=answer_vocab or [],
+                n_samples=args.n_samples,
+                sigma=level,
+                perturbation_type="gaussian",
+                seed=args.seed,
+                class_batch_size=args.class_batch_size,
+            )
+            level_label = f"σ={level}"
+        else:
+            print(f"\nScoring {args.dataset} {args.split} — missing fraction={level:.2f}  N={args.n_samples} ...")
+            scorer = MCSpUScorer(
+                model=model,
+                answer_vocab=answer_vocab or [],
+                n_samples=args.n_samples,
+                missing_fraction=level,
+                perturbation_type="missing",
+                seed=args.seed,
+                class_batch_size=args.class_batch_size,
+            )
+            level_label = f"missing={level:.2f}"
 
-    # Write output
-    with open(args.output, "w") as f:
+        results = scorer.score_dataset(dataset, max_samples=args.max_samples)
+
         for r in results:
-            f.write(json.dumps(r) + "\n")
-    print(f"\nResults written to {args.output}")
+            r["checkpoint"] = args.checkpoint
+            r["dataset"] = args.dataset
+            r["split"] = args.split
+            r["llm_id"] = args.llm_id
+            r["model_type"] = args.model_type
 
-    _print_summary(results, args)
+        all_results.extend(results)
+        _print_summary(results, args, level_label=level_label)
+
+    with open(args.output, "w") as f:
+        for r in all_results:
+            f.write(json.dumps(r) + "\n")
+    print(f"\nAll results written to {args.output}  ({len(all_results)} records)")
 
 
 if __name__ == "__main__":

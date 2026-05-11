@@ -273,6 +273,10 @@ def main():
         all_results.extend(results)
         _print_summary(results, args, level_label=level_label)
 
+    out_dir = os.path.dirname(args.output)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     with open(args.output, "w") as f:
         for r in all_results:
             f.write(json.dumps(r) + "\n")

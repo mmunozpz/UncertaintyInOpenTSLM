@@ -657,6 +657,17 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
         else:
             raise RuntimeError("No recognized model state key in checkpoint.")
 
+        # Training checkpoints save model.state_dict() on OpenTSLMFlamingo, which
+        # registers the same TSF object as both self.model and self.llm — producing
+        # duplicate "model.*" and "llm.*" prefixed keys. Extract only the "llm.*"
+        # set (preferred) or "model.*" and strip the prefix so bare keys match
+        # self.llm's own state_dict format. Bare keys (from store_to_file) are
+        # loaded as-is.
+        if any(k.startswith("llm.") for k in model_state):
+            model_state = {k[4:]: v for k, v in model_state.items() if k.startswith("llm.")}
+        elif any(k.startswith("model.") for k in model_state):
+            model_state = {k[6:]: v for k, v in model_state.items() if k.startswith("model.")}
+
         missing_keys, unexpected_keys = self.llm.load_state_dict(
             model_state, strict=False)
         if missing_keys:

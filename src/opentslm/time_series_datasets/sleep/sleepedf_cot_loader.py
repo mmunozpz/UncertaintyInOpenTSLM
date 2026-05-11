@@ -20,19 +20,35 @@ SLEEPEDF_RELEASE_URL = "https://polybox.ethz.ch/index.php/s/ZryWSdCFJZ9JR3R/down
 TEST_FRAC = 0.1
 VAL_FRAC = 0.1
 
+_MIN_CSV_BYTES = 100 * 1024 * 1024  # 100 MB — a partial download is always smaller
+
+
+def _csv_is_valid() -> bool:
+    """Return True only if the CSV exists and is large enough to be a complete download."""
+    if not os.path.exists(COT_CSV):
+        return False
+    size = os.path.getsize(COT_CSV)
+    if size < _MIN_CSV_BYTES:
+        print(f"  [sleepedf] CSV found but too small ({size / 1e6:.1f} MB < {_MIN_CSV_BYTES / 1e6:.0f} MB) — treating as corrupt.")
+        os.remove(COT_CSV)
+        return False
+    return True
+
+
 def download_and_extract_sleepedf():
     """
     Download the SleepEDF CoT CSV into data/sleep/ if not already present, with a progress bar.
     """
-    if os.path.exists(SLEEP_DATA_DIR) and os.path.exists(COT_CSV):
+    if _csv_is_valid():
         print(f"SleepEDF CoT dataset already exists at {COT_CSV}")
         return
     os.makedirs(SLEEP_DATA_DIR, exist_ok=True)
     print(f"Downloading SleepEDF CoT dataset from {SLEEPEDF_RELEASE_URL}...")
+    tmp_path = COT_CSV + ".tmp"
     try:
         with urllib.request.urlopen(SLEEPEDF_RELEASE_URL) as response:
             total = int(response.headers.get('content-length', 0))
-            with open(COT_CSV, "wb") as f, tqdm(
+            with open(tmp_path, "wb") as f, tqdm(
                 total=total, unit='B', unit_scale=True, desc="Downloading sleep_cot.csv"
             ) as pbar:
                 for chunk in iter(lambda: response.read(8192), b""):
@@ -40,8 +56,11 @@ def download_and_extract_sleepedf():
                         break
                     f.write(chunk)
                     pbar.update(len(chunk))
+        os.replace(tmp_path, COT_CSV)
         print("Download completed successfully.")
     except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
         raise RuntimeError(f"Failed to download SleepEDF CoT dataset: {e}")
     if not os.path.exists(COT_CSV):
         raise FileNotFoundError(f"sleep_cot.csv not found after download in {SLEEP_DATA_DIR}")

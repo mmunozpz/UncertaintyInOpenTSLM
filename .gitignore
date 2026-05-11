@@ -24,3 +24,5 @@ dist/
 
 models/
 .claude/
+
+venv/

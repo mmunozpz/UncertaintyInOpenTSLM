@@ -115,6 +115,12 @@ def _add_noise(sample: Dict[str, Any], sigma: float, rng: np.random.Generator) -
     return noisy
 
 
+def _mask_missing(sample: Dict[str, Any], fraction: float, rng: np.random.Generator) -> Dict[str, Any]:
+    """Deep-copy sample and zero out a random fraction of timepoints per channel."""
+    from opentslm.uncertainty.mcspu import add_missing_data
+    return add_missing_data(sample, fraction, rng)
+
+
 def _kl(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-10) -> float:
     p, q = p.float(), q.float()
     # clamp: fp32 arithmetic can produce tiny negatives (~1e-7) that aren't real
@@ -141,31 +147,33 @@ def score_sample(
     sample: Dict[str, Any],
     vocab: List[str],
     n_noise: int,
-    sigma: float,
+    perturb_fn,
     class_batch: int,
     rng: np.random.Generator,
 ) -> Dict[str, Any]:
-    """Run N+1 forward passes and return the MCSPU record for one sample."""
+    """Run N+1 forward passes and return the MCSPU record for one sample.
+
+    perturb_fn(sample, rng) -> perturbed_sample
+    """
     # clean pass
     clean_lp = _get_logprobs(model, sample, vocab, class_batch)
     p0 = torch.softmax(clean_lp.float(), dim=0)
 
     per_kl: List[float] = []
     for _ in range(n_noise):
-        noisy = _add_noise(sample, sigma, rng)
-        noisy_lp = _get_logprobs(model, noisy, vocab, class_batch)
+        perturbed = perturb_fn(sample, rng)
+        noisy_lp = _get_logprobs(model, perturbed, vocab, class_batch)
         pi = torch.softmax(noisy_lp.float(), dim=0)
         per_kl.append(_kl(p0, pi))
         if model.device != "cpu":
             torch.cuda.empty_cache()
 
     return {
-        "mcspu_score":   float(np.mean(per_kl)),
+        "mcspu_score":    float(np.mean(per_kl)),
         "clean_logprobs": clean_lp.tolist(),
         "clean_probs":    p0.tolist(),
         "clean_pred":     vocab[int(torch.argmax(p0).item())],
         "per_noise_kl":   per_kl,
-        "sigma":          sigma,
         "n_samples":      n_noise,
         "answer_vocab":   vocab,
     }
@@ -176,7 +184,7 @@ def score_dataset(
     dataset,
     default_vocab: Optional[List[str]],
     n_noise: int,
-    sigma: float,
+    perturb_fn,
     class_batch: int,
     max_samples: int,
     seed: int,
@@ -189,7 +197,7 @@ def score_dataset(
         sample = dataset[idx]
         vocab = sample.get("possible_answers") or default_vocab
         result = score_sample(model, sample, vocab,
-                              n_noise, sigma, class_batch, rng)
+                              n_noise, perturb_fn, class_batch, rng)
         result["sample_idx"] = idx
         result["ground_truth"] = sample.get("answer", "")
         results.append(result)
@@ -577,6 +585,122 @@ def generate_all_plots(reports, sigma_data_all, sigmas, out_dir):
     plot_test_metrics(reports, sigma_lo, sigma_hi, out_dir)
 
 
+# MISSING DATA ANALYSIS (exploratory — no thresholds)
+
+
+def print_missing_summary(fraction_data: Dict[float, List[dict]], label: str) -> None:
+    fractions = sorted(fraction_data.keys())
+    div = "─" * 52
+    print(f"\n{_B}MISSING DATA ANALYSIS — {label}{_RST}")
+    print(f"  {_Y}(exploratory — no pass/fail thresholds){_RST}")
+    print(div)
+    print(f"  {'fraction':>10}  {'mean_mcspu':>12}  {'std':>10}  {'n':>6}")
+    print(div)
+    for frac in fractions:
+        scores = np.array([r["mcspu_score"] for r in fraction_data.get(frac, [])])
+        if len(scores) == 0:
+            continue
+        print(f"  {frac:>10.2f}  {scores.mean():>12.6f}  {scores.std():>10.6f}  {len(scores):>6}")
+    print()
+
+
+def plot_mcspu_vs_fraction(label: str, fraction_data: Dict[float, List[dict]],
+                           colour: str, out_dir: "Path") -> None:
+    fracs = sorted(fraction_data.keys())
+    ys, cis = [], []
+    for f in fracs:
+        sc = np.array([r["mcspu_score"] for r in fraction_data.get(f, [])])
+        ys.append(sc.mean())
+        cis.append(1.96 * sc.std() / np.sqrt(len(sc)))
+    ys, cis = np.array(ys), np.array(cis)
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(fracs, ys, marker="o", color=colour, linewidth=2, label=label)
+    ax.fill_between(fracs, ys - cis, ys + cis, alpha=0.15, color=colour)
+    ax.set_xlabel("Missing fraction")
+    ax.set_ylabel("Mean MCSPU (± 95 % CI)")
+    ax.set_title(f"Signal sensitivity vs missing data — {label}")
+    ax.set_xticks(fracs)
+    ax.legend(fontsize=9, frameon=False)
+    fig.tight_layout()
+    _save(fig, out_dir / "mcspu_vs_fraction")
+
+
+def plot_distributions_missing(label: str, fraction_data: Dict[float, List[dict]],
+                               colour: str, out_dir: "Path") -> None:
+    fracs = sorted(fraction_data.keys())
+    fig, axes = plt.subplots(1, len(fracs), figsize=(3.5 * len(fracs), 4.5), sharey=False)
+    if len(fracs) == 1:
+        axes = [axes]
+
+    for col, frac in enumerate(fracs):
+        ax = axes[col]
+        sc = [r["mcspu_score"] for r in fraction_data.get(frac, [])]
+        if not sc:
+            ax.set_title(f"fraction={frac}\n(no data)")
+            continue
+        vp = ax.violinplot([sc], positions=[1], showmedians=True, showextrema=False)
+        for body in vp["bodies"]:
+            body.set_facecolor(colour)
+            body.set_alpha(0.7)
+        vp["cmedians"].set_color("black")
+        vp["cmedians"].set_linewidth(1.5)
+        ax.set_xticks([1])
+        ax.set_xticklabels([label], fontsize=9)
+        ax.set_title(f"fraction = {frac}")
+        if col == 0:
+            ax.set_ylabel("MCSPU score")
+
+    fig.suptitle(f"Per-sample MCSPU distributions (missing data) — {label}", fontsize=11)
+    fig.tight_layout()
+    _save(fig, out_dir / "distributions_missing")
+
+
+def plot_signal_example(dataset, fractions: List[float], out_dir: "Path") -> None:
+    from opentslm.uncertainty.mcspu import add_missing_data
+    sample = dataset[0]
+    ts = sample["time_series"]
+    if isinstance(ts, torch.Tensor):
+        channel = ts[0].cpu().numpy()
+    else:
+        channel = np.asarray(ts[0], dtype=np.float64)
+
+    rng = np.random.default_rng(0)
+    n_cols = len(fractions) + 1
+    fig, axes = plt.subplots(1, n_cols, figsize=(3.5 * n_cols, 3), sharey=True)
+    if n_cols == 1:
+        axes = [axes]
+
+    axes[0].plot(channel, linewidth=0.8, color="#4C72B0")
+    axes[0].set_title("Original")
+    axes[0].set_xlabel("Timepoint")
+    axes[0].set_ylabel("Amplitude")
+
+    for col, frac in enumerate(fractions, start=1):
+        masked = add_missing_data(sample, frac, rng)
+        mts = masked["time_series"]
+        if isinstance(mts, torch.Tensor):
+            m_ch = mts[0].cpu().numpy()
+        else:
+            m_ch = np.asarray(mts[0], dtype=np.float64)
+        axes[col].plot(m_ch, linewidth=0.8, color="#DD8452")
+        axes[col].set_title(f"Missing {int(frac * 100)}%")
+        axes[col].set_xlabel("Timepoint")
+
+    fig.suptitle("Effect of missing data masking (channel 0, sample 0)", fontsize=11)
+    fig.tight_layout()
+    _save(fig, out_dir / "signal_example_missing")
+
+
+def generate_missing_plots(label: str, fraction_data: Dict[float, List[dict]],
+                           dataset, fractions: List[float], out_dir: "Path") -> None:
+    plt.rcParams.update(STYLE)
+    colour = PALETTE.get(label, "#8172B2")
+    plot_mcspu_vs_fraction(label, fraction_data, colour, out_dir)
+    plot_distributions_missing(label, fraction_data, colour, out_dir)
+    plot_signal_example(dataset, fractions, out_dir)
+
+
 # MAIN
 
 def parse_args():
@@ -596,15 +720,21 @@ def parse_args():
     p.add_argument("--device",      default=None,
                    help="cuda | cpu | mps (default: auto-detect)")
     #  scoring
+    p.add_argument("--perturbation_type", nargs="+", default=["gaussian"],
+                   choices=["gaussian", "missing"],
+                   help="One or both perturbation modes: gaussian missing")
     p.add_argument("--n_noise",     type=int,   default=50,
                    help="Noise draws N per sample")
     p.add_argument("--max_samples", type=int,   default=200,
-                   help="Max test samples per sigma")
+                   help="Max test samples per parameter value")
     p.add_argument("--class_batch", type=int,   default=8,
                    help="Max answer candidates per GPU forward pass")
     p.add_argument("--sigmas",      type=float, nargs="+",
                    default=[0.1, 0.5, 1.0, 2.0],
-                   help="Noise levels to sweep")
+                   help="Noise levels to sweep (gaussian mode)")
+    p.add_argument("--missing_fractions", type=float, nargs="+",
+                   default=[0.1, 0.25, 0.5, 0.75, 1.0],
+                   help="Fraction of timepoints to zero per channel (missing mode)")
     p.add_argument("--seed",        type=int,   default=42)
     #  output
     p.add_argument("--out_dir",     type=Path, default=Path("plots"),
@@ -617,16 +747,19 @@ def main():
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    sigmas = sorted(args.sigmas)
-    sigma_lo, sigma_hi = sigmas[0], sigmas[-1]
-
     cfg = STAGE_REGISTRY[args.dataset]
+    ptypes = args.perturbation_type
 
     print(f"\nOpenTSLM MCSPU Production Gate")
     print(f"  checkpoint={args.checkpoint}")
     print(f"  dataset={args.dataset}  model_type={args.model_type}")
     print(f"  device={device}  n_noise={args.n_noise}  max_samples={args.max_samples}"
-          f"  class_batch={args.class_batch}  sigmas={sigmas}\n")
+          f"  class_batch={args.class_batch}  perturbation_type={ptypes}")
+    if "gaussian" in ptypes:
+        print(f"  sigmas={sorted(args.sigmas)}")
+    if "missing" in ptypes:
+        print(f"  missing_fractions={sorted(args.missing_fractions)}")
+    print()
 
     if not args.checkpoint.exists():
         print(f"[error] checkpoint not found: {args.checkpoint}")
@@ -636,37 +769,61 @@ def main():
     dataset = load_dataset_split(args.dataset, model.get_eos_token())
     print(f"  dataset size: {len(dataset)} test samples", flush=True)
 
-    sigma_data: Dict[float, List[dict]] = {}
-    for sigma in sigmas:
-        print(f"  σ={sigma}", flush=True)
-        sigma_data[sigma] = score_dataset(
-            model, dataset,
-            default_vocab=cfg["answer_vocab"],
-            n_noise=args.n_noise,
-            sigma=sigma,
-            class_batch=args.class_batch,
-            max_samples=args.max_samples,
-            seed=args.seed,
+    exit_code = 0
+
+    # ── GAUSSIAN: PASS/FAIL production gate ───────────────────────────────
+    if "gaussian" in ptypes:
+        sigmas = sorted(args.sigmas)
+        sigma_lo, sigma_hi = sigmas[0], sigmas[-1]
+        sigma_data: Dict[float, List[dict]] = {}
+        for sigma in sigmas:
+            print(f"\n  [gaussian] σ={sigma}", flush=True)
+            sigma_data[sigma] = score_dataset(
+                model, dataset,
+                default_vocab=cfg["answer_vocab"],
+                n_noise=args.n_noise,
+                perturb_fn=lambda s, r, _s=sigma: _add_noise(s, _s, r),
+                class_batch=args.class_batch,
+                max_samples=args.max_samples,
+                seed=args.seed,
+            )
+
+        report = StageReport(
+            stage_key=args.dataset,
+            label=cfg["label"],
+            sanity=run_sanity(sigma_data),
+            sensitivity=run_sensitivity(sigma_data, sigma_lo, sigma_hi),
         )
+        exit_code = print_report([report])
+
+        print("Generating gaussian plots …")
+        generate_all_plots([report], {args.dataset: sigma_data}, sigmas, args.out_dir)
+        print(f"Gaussian plots saved to {args.out_dir}/\n")
+
+    # ── MISSING DATA: exploratory analysis, no thresholds ─────────────────
+    if "missing" in ptypes:
+        fractions = sorted(args.missing_fractions)
+        fraction_data: Dict[float, List[dict]] = {}
+        for frac in fractions:
+            print(f"\n  [missing] fraction={frac}", flush=True)
+            fraction_data[frac] = score_dataset(
+                model, dataset,
+                default_vocab=cfg["answer_vocab"],
+                n_noise=args.n_noise,
+                perturb_fn=lambda s, r, _f=frac: _mask_missing(s, _f, r),
+                class_batch=args.class_batch,
+                max_samples=args.max_samples,
+                seed=args.seed,
+            )
+
+        print_missing_summary(fraction_data, cfg["label"])
+        print("Generating missing data plots …")
+        generate_missing_plots(cfg["label"], fraction_data, dataset, fractions, args.out_dir)
+        print(f"Missing data plots saved to {args.out_dir}/\n")
 
     del model
     if device != "cpu":
         torch.cuda.empty_cache()
-
-    report = StageReport(
-        stage_key=args.dataset,
-        label=cfg["label"],
-        sanity=run_sanity(sigma_data),
-        sensitivity=run_sensitivity(sigma_data, sigma_lo, sigma_hi),
-    )
-    reports = [report]
-    sigma_data_all = {args.dataset: sigma_data}
-
-    exit_code = print_report(reports)
-
-    print("Generating plots …")
-    generate_all_plots(reports, sigma_data_all, sigmas, args.out_dir)
-    print(f"Plots saved to {args.out_dir}/\n")
 
     sys.exit(exit_code)
 

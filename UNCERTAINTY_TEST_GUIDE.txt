@@ -1,15 +1,28 @@
-================================================================
-MCSPU UNCERTAINTY TEST SUITE — TEAM GUIDE
-================================================================
+===================================================================================================================================================================
+MCSPU UNCERTAINTY TEST — TEAM GUIDE
+===================================================================================================================================================================
 
 QUICK START
 
-The script test for any new model checkpoint.
-It uses MCSPU (Monte Carlo Signal Perturbation Uncertainty) to ensure that the model increases 
-uncertainty when adding noise, to check whether the model is actually relying on the signal.
-A model that does not use the signal fails.
+The script tests any new model checkpoint using MCSPU (Monte Carlo Signal Perturbation Uncertainty).
+Three perturbation modes are available via --perturbation_type:
 
-Minimal call (auto-detects GPU):
+  gaussian (default)  — PASS/FAIL production gate: checks the model is actually relying on the signal.
+                        A model that ignores the signal fails. Exit code: 0 = PASS, 1 = FAIL.
+
+  missing_zeros       — Exploratory only, no thresholds. A random fraction of timepoints per
+                        channel is set to 0. Sweeps missing_fraction ∈ {0.1, 0.25, 0.5, 0.75, 1.0}.
+                        Tests how quickly the model degrades as data goes missing.
+
+  missing_channels    — Exploratory only, no thresholds. Entire channels are blacked out
+                        (set to 0) one at a time (or in combinations). Shows which channels the encoder
+                        relies on most. Uses dataset-specific presets unless --drop_channels is used.
+
+Multiple modes can be run together: --perturbation_type gaussian missing_zeros missing_channels
+
+---
+
+Minimal call, Gaussian gate:
 
     python opentslm_uncertainty_test.py \
         --checkpoint models/my_har_model.pt \
@@ -17,38 +30,37 @@ Minimal call (auto-detects GPU):
         --model_type sp \
         --device     cuda
 
-Full call with all options:
+Full call with all options, all three perturbation modes:
 
     python opentslm_uncertainty_test.py \
-        --checkpoint  models/my_ecg_model.pt \
-        --dataset     ecg_qa \
-        --model_type  sp \
-        --llm_id      meta-llama/Llama-3.2-1B \
-        --device      cuda \
-        --n_noise     50 \
-        --max_samples 200 \
-        --class_batch 8 \
-        --sigmas      0.1 0.5 1.0 2.0 \
-        --out_dir     plots/
+        --checkpoint         models/my_ecg_model.pt \
+        --dataset            ecg_qa \
+        --model_type         sp \
+        --llm_id             meta-llama/Llama-3.2-1B \
+        --device             cuda \
+        --n_noise            50 \
+        --max_samples        200 \
+        --class_batch        16 \
+        --sigmas             0.1 0.5 1.0 2.0 \
+        --missing_fractions  0.1 0.25 0.5 0.75 1.0 \
+        --out_dir            plots/ \
+        --perturbation_type  gaussian missing_zeros missing_channels \
 
 IMPORTANT: try not to use less than n_noise = 50 and max_samples = 200 (statistically significant)
 
---dataset choices:    tsqa | har | sleep | ecg_qa
---model_type choices: sp | flamingo
+--dataset choices:          tsqa | har | sleep | ecg_qa
+--model_type choices:       sp | flamingo
+--perturbation_type choices: gaussian | missing_zeros | missing_channels  (combine freely just with a space in between)
 
-Exit code:
-    0  PRODUCTION READY  -> all tests passed, model uses the signal
-    1  NOT PRODUCTION READY -> at least one test failed
+Exit code for gaussian mode:
+    0  PRODUCTION READY  -> all Gaussian tests passed
+    1  NOT PRODUCTION READY -> at least one Gaussian test failed
 
-
-----------------------------------------------------------------
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
 BACKGROUND: WHAT IS MCSPU?
-----------------------------------------------------------------
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-Monte Carlo Signal Perturbation Uncertainty (MCSPU) is a
-per-sample score that measures how much a model's output
-distribution changes when the input time-series is perturbed
-by small additive Gaussian noise.
+Monte Carlo Signal Perturbation Uncertainty (MCSPU) is a per-sample score that measures how much a model's output distribution changes when the input time-series is perturbed.
 
 Formally, for one test sample:
 
@@ -61,70 +73,103 @@ where:
   N         = number of noise draws (default: 50)
 
 Interpretation:
-  HIGH U_signal → model output shifts when signal is perturbed
-                  → model actively uses the signal content
-  LOW  U_signal → model output barely changes regardless of signal
-                  → model ignores the signal, answers from text/prior
+  HIGH MCSPU → model output distribution shifts when signal is perturbed, the model is really using the signal content
+  LOW  MCSPU → model output barely changes regardless of signal, the model is ignoring the signal, it is answering from text/prior only
 
-We sweep σ ∈ {0.1, 0.5, 1.0, 2.0} to check that the model
-shows INCREASING sensitivity as noise gets larger.
-
-Check https://docs.google.com/presentation/d/1ry3dPZKT27JIxMl1WJfr58Jk8dr9dkhqISxPgbPBass/edit?usp=sharing for details 
+In gaussian mode sweep σ ∈ {0.1, 0.5, 1.0, 2.0} to check that the model shows INCREASING sensitivity as noise gets larger.
+Check https://docs.google.com/presentation/d/1ry3dPZKT27JIxMl1WJfr58Jk8dr9dkhqISxPgbPBass/edit?usp=sharing for details.
 
 
-================================================================
-TEST CATEGORIES
-================================================================
+===================================================================================================================================================================
+MISSING DATA ANALYSIS  (exploratory, no pass/fail thresholds)
+===================================================================================================================================================================
+
+Two missing-data modes are available, both exploratory. Neither has pass/fail thresholds.
+They use the same MCSPU formula as the Gaussian gate but with structural perturbations instead of noise.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MODE: missing_zeros  (--perturbation_type missing_zeros)
+Temporal masking, a random fraction of timepoints per channel is set to 0.0.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    U_signal(x) = (1/N) Σ_i  KL( p_clean || p_masked_i )
+
+where:
+  p_masked_i = model output when missing_fraction of each channel's timepoints are zeroed
+               (each draw i uses a different random mask)
+  N          = number of draws (default: 50)
+
+The sweep covers missing_fraction ∈ {0.1, 0.25, 0.5, 0.75, 1.0}.
+
+PLOTS GENERATED (missing_zeros mode)
+  mcspu_vs_fraction.png        — Mean ± 95% CI vs missing fraction (the main robustness curve)
+  distributions_missing.png    — Violin plots of per-sample MCSPU at each fraction
+  signal_example_missing.png   — Channel 0 of sample 0, shown at each masking level
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MODE: missing_channels  (--perturbation_type missing_channels)
+Channel ablation: entire channels are blacked out (all timepoints set to 0.0).
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    U_signal(x) = (1/N) Σ_i  KL( p_clean || p_ablated_i )
+
+where:
+  p_ablated_i = model output when a specific set of channels is completely zeroed out
+               (N draws use the same blackout mask, variance comes from the N scoring passes)
+
+By default the script uses dataset-specific presets.
+  HAR presets    (3 channels: X=0, Y=1, Z=2):  drop X, drop Y, drop Z
+  ECG-QA presets (12 leads: I=0…aVF=5, V1=6…V6=11):  drop I, drop II, drop V1, drop std. limb (I,II,III), drop all limb (0-5), drop precordial (V1-V6)
+Custom configurations: --drop_channels 0 --drop_channels 0,1  (repeat flag for multiple configs)
+
+PLOTS GENERATED (missing_channels mode)
+  mcspu_vs_channel_config.png      — Bar chart: mean MCSPU ± 95% CI per channel blackout config
+  distributions_channel_dropout.png — Violin plots of per-sample MCSPU per config
+  signal_example_channel.png        — Visual reference: channel 0 of sample 0 before/after blackout
+
+All missing-mode plots are saved to --out_dir with distinct filenames from the Gaussian plots.
+
+===================================================================================================================================================================
+TEST CATEGORIES  (Gaussian mode only)
+===================================================================================================================================================================
 
 There are two categories with different pass/fail semantics.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CATEGORY 1 — SANITY TESTS  (must always pass)
-Mathematical invariants: failure means the computation is broken,
-not that the model is bad.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CATEGORY 1 — SANITY TESTS 
+Mathematical checks, failure means the computation is broken, not that the model is bad.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 TEST: no_nan_inf_scores
   What:   Checks every mcspu_score is a finite real number.
-  Why:    NaN/Inf indicates numerical overflow (e.g., log(0) in KL)
-          or a model that returned degenerate probabilities.
+  Why:    NaN/Inf indicates numerical overflow (e.g., log(0) in KL) or a model that returned degenerate probabilities.
   Pass:   0 records with NaN or Inf mcspu_score.
-  Data:   All 4 models: 0 bad records across 800 records each.
 
 TEST: kl_nonneg
   What:   Checks every individual KL divergence value ≥ 0.
-  Why:    KL(P||Q) ≥ 0 is a mathematical theorem (Gibbs inequality).
-          A negative value means numerical error in the computation.
-  Pass:   min(per_noise_kl) ≥ −1e-9  (tiny tolerance for float rounding)
-  Data:   All 4 models: minimum observed KL = 0.000000 nats.
+  Why:    KL(P||Q) ≥ 0 is a mathematical theorem (Gibbs inequality). A negative value means numerical error in the computation.
+  Pass:   min(per_noise_kl) ≥ −1e-6  (tolerance for float32 KL rounding noise)
 
 TEST: score_consistency
   What:   Checks mcspu_score ≈ mean(per_noise_kl) for every record.
-  Why:    mcspu_score is defined as the mean of per_noise_kl.
-          Disagreement means the output was not assembled correctly.
+  Why:    mcspu_score is defined as the mean of per_noise_kl. Disagreement means the output was not assembled correctly.
   Pass:   max |mcspu_score − mean(per_noise_kl)| ≤ 1e-5 nats.
-  Data:   All 4 models: maximum observed delta < 1e-7 nats (float32 precision).
 
 TEST: probs_normalized
   What:   Checks that clean_probs sums to 1.0 for every record.
-  Why:    The output of softmax must be a valid probability distribution.
-          Large deviations indicate a tokenization or logit error.
+  Why:    The output of softmax must be a valid probability distribution. Large deviations indicate a tokenization or logit error.
   Pass:   max |Σ clean_probs − 1.0| ≤ 1e-3.
-  Data:   All 4 models: maximum observed deviation < 5e-7.
 
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CATEGORY 2 — SIGNAL SENSITIVITY TESTS  (must always pass)
-Every model must demonstrate genuine signal sensitivity to be
-production-ready.  A model that ignores the signal fails here,
-regardless of which dataset it was trained on.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CATEGORY 2 — SIGNAL SENSITIVITY TESTS  
+Our models must demonstrate signal sensitivity.  A model that ignores the signal fails here, regardless of which dataset it was trained on.
+The thresholds were derived comparing TSQA, HAR, Sleep EDF and ECG-QA sp models from HF. ECG-QA was clearly ignoring the signal and its results where used to stablish the thresholds for the test with sufficienet margin for future models.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 TEST: sensitivity_magnitude
   What:   Mean MCSPU score at σ=2.0 (the largest perturbation).
-  Why:    A model that uses the signal must show measurable output
-          shift when the signal is heavily corrupted. A model that
-          ignores the signal will show near-zero shift at any σ.
+  Why:    A model that uses the signal must show measurable output shift when the signal is heavily corrupted. A model that ignores the signal will show near-zero shift at any σ.
   Threshold: mean_mcspu(σ=2.0) > 0.05 nats
   Threshold justification:
     Observed at σ=2.0 in the 200-sample, N=50 experiment:
@@ -132,17 +177,11 @@ TEST: sensitivity_magnitude
       HAR:       0.6583  →  13× above threshold
       Sleep EDF: 0.4642  →   9× above threshold
       ECG-QA:    0.0011  →  45× BELOW threshold
-    The threshold of 0.05 sits in a clear gap between the
-    worst-case passing model (TSQA at 0.28) and ECG (0.001),
-    giving a separation factor of 280×. The threshold is
-    conservative to remain valid across different
-    random seeds, sample counts, and model versions.
+    The threshold of 0.05 sits in a clear gap between the worst-case passing model (TSQA at 0.28) and ECG (0.001), giving a separation factor of 280×. 
 
 TEST: sensitivity_range
   What:   Absolute growth MCSPU(σ=2.0) − MCSPU(σ=0.1).
-  Why:    Even if a model has non-zero MCSPU, it must increase with σ
-          in absolute terms. A model ignoring the signal will have
-          the same tiny score at all σ values.
+  Why:    Even if a model has non-zero MCSPU, it must increase with σ in absolute terms. A model ignoring the signal will have the same tiny score at all σ values.
   Threshold: MCSPU(σ=2.0) − MCSPU(σ=0.1) > 0.02 nats
   Threshold justification:
     Observed absolute growth:
@@ -150,17 +189,13 @@ TEST: sensitivity_range
       HAR:       0.6541 nats  →  33× above threshold
       Sleep EDF: 0.4484 nats  →  22× above threshold
       ECG-QA:    0.0000 nats  →  at noise floor (below threshold)
-    Threshold of 0.02 is 20× the ECG observed range (0.001),
-    giving ample margin against noise and sample variance.
+    Threshold of 0.02 is 20× the ECG observed range (0.001), giving ample margin against noise and sample variance.
 
 TEST: statistical_significance
-  What:   One-sided Mann-Whitney U test comparing the distribution
-          of MCSPU scores at σ=0.1 vs σ=2.0.
+  What:   One-sided Mann-Whitney U test comparing the distribution of MCSPU scores at σ=0.1 vs σ=2.0.
           H₁: scores at σ=2.0 are stochastically greater than at σ=0.1
-  Why:    The magnitude test could theoretically be fooled by a skewed
-          distribution with a high mean but no consistent ordering.
-          The Mann-Whitney U tests the full distribution and is robust
-          to outliers and non-normality.
+  Why:    The magnitude test could theoretically be fooled by a skewed distribution with a high mean but no consistent ordering.
+          The Mann-Whitney U tests the full distribution and is robust to outliers and non-normality.
   Threshold: p-value < 0.05  (standard frequentist significance level)
   Threshold justification:
     Observed p-values:
@@ -168,34 +203,124 @@ TEST: statistical_significance
       HAR:       2.4e-67  →  rejected at any reasonable α
       Sleep EDF: 2.5e-67  →  rejected at any reasonable α
       ECG-QA:    0.4031   →  failed to reject H₀ (no significant difference)
-    ECG-QA p=0.40 is consistent with the null hypothesis that the
-    distributions at σ=0.1 and σ=2.0 are identical (exactly what
-    we expect for a model that is ignoring the signal).
+    ECG-QA p=0.40 is consistent with the null hypothesis that the distributions at σ=0.1 and σ=2.0 are identical (exactly what we expect for a model that is ignoring the signal).
 
 TEST: effect_size
   What:   Cohen's d between σ=0.1 and σ=2.0 MCSPU distributions.
           d = (mean_hi − mean_lo) / pooled_std
-  Why:    Statistical significance alone does not tell us whether the
-          effect is practically meaningful. With N=200 samples, even
-          a trivially small difference can reach p<0.05. Cohen's d
-          measures practical significance independently of N.
+  Why:    Statistical significance alone does not tell us whether the effect is practically meaningful. With N=200 samples, even a trivially small difference can reach p<0.05. Cohen's d measures practical significance independently of N.
   Threshold: Cohen's d > 0.3
   Threshold justification:
     Cohen's conventions: 0.2=small, 0.5=medium, 0.8=large.
-    We set 0.3 (between small and medium) as the minimum for a
-    model to be considered genuinely signal-sensitive.
+    0.3 is set (between small and medium) as the minimum for a model to be considered genuinely signal-sensitive.
     Observed d values:
       TSQA:      2.39  →  very large effect (8× above threshold)
       HAR:       3.58  →  very large effect (12× above threshold)
       Sleep EDF: 1.89  →  large effect (6× above threshold)
       ECG-QA:    0.01  →  negligible effect (30× below threshold)
-    All passing models show large to very large effects, giving
-    high confidence the result is not a statistical artefact.
+    All passing models show large to very large effects, giving high confidence the result is not a statistical artefact.
+
+===================================================================================================================================================================
+FLAMINGO THRESHOLDS  (model_type=flamingo only)
+===================================================================================================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHY SP AND FLAMINGO PRODUCE STRUCTURALLY DIFFERENT MCSPU VALUES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SP (Soft Prompt) — signal pathway:
+
+    time_series  →  TransformerCNNEncoder  →  MLPProjector  →  [ts_tok₁, …, ts_tokₖ]
+                                                                         ↓
+    Attached directly into the LLM token sequence:
+            LLM input = [ts_tok₁ … ts_tokₖ | text_tok₁ … text_tokₙ]
+
+    Every transformer attention layer in the LLM attends to those soft tokens at FULL, UNATTENUATED weight.
+    The signal lives in the same residual stream as the text from layer 1 onward. When you perturb the signal,
+    the soft tokens change substantially, every layer feels it, and the output distribution shifts a lot.
+    Typical MCSPU at σ=2.0 for trained SP checkpoints: 0.05 – 0.15 nats.
+
+Flamingo — signal pathway:
+
+    time_series  →  TransformerCNNEncoder  →  vision features
+                                                     ↓
+    LLM residual stream passes through gated cross-attention blocks inserted between LLM layers:
+
+        x_new = x  +  tanh(gate) × cross_attn(x, vision_features)
+                              ↑
+                    learned scalar, initialized at 0.0
+
+    The signal reaches the LLM only through these blocks, and each block's contribution is scaled
+    by tanh(gate).
+
+    Effect on MCSPU: perturbing the signal moves the cross-attention output, but that output is then
+    scaled by tanh(gate) before entering the residual stream. If tanh(gate) = 0.15, only 15% of the
+    cross-attention perturbation actually flows through. The KL between clean and noisy distributions
+    is structurally suppressed by ~10-20× compared to SP.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+THE OBSERVATION THAT PROMPTED SEPARATE CALIBRATION: sleep_flamingo
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+sleep_flamingo was tested against SP_THRESHOLDS and produced this result:
+
+    Test                      Threshold (SP)   Measured     Result
+    ─────────────────────────────────────────────────────────────────
+    sensitivity_magnitude     > 0.05 nats      0.0103       FAIL
+    sensitivity_range         > 0.02 nats      ~0.009       FAIL
+    statistical_significance  p < 0.05         p << 0.05    PASS
+    effect_size               Cohen's d > 0.30 d > 0.30     PASS
+
+The two tests that PASSED are the relative tests: the growth from σ=0.1 to σ=2.0 was statistically
+real and had a large effect size, the model was really responding to signal perturbation.
+
+The two tests that FAILED are the absolute magnitude tests: the response was ~5× smaller than the
+SP threshold, not because the model was ignoring the signal, but because the Flamingo gate bottleneck
+structurally suppresses absolute KL.
+
+Conclusion: flamingo architectures needed to be calirated with a different threshold.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CALIBRATION DATA AND THRESHOLD DERIVATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All available official Flamingo pretrained checkpoints were run through MCSPU (gaussian mode,
+σ ∈ {0.1, 0.5, 1.0, 2.0}, n_noise=50, max_samples=200):
+
+    Checkpoint         MCSPU(σ=2.0)   Cohen's d   Mann-Whitney   Verdict
+    ──────────────────────────────────────────────────────────────────────────────────────────
+    har_flamingo       0.0570         2.61         PASS           Signal clearly used
+    sleep_flamingo     0.0103         1.12         PASS           Signal clearly used, gates more suppressed
+    ecg_flamingo       0.0004         0.76         FAIL           Effectively zero, model blind to signal
+
+   This gave the reference points for calibration.
+
+  Natural separation between tightest PASS and clear FAIL:
+    sleep_flamingo: 0.0103 nats  (tightest passer)
+    ecg_flamingo:   0.0004 nats  (clearest failure)
+    Gap: ~25×
+
+  Threshold of 0.008 nats sits inside this gap with margin on both sides:
+    0.008 / 0.0103 = 0.78  →  1.3× below the tightest passing model (sleep)
+    0.008 / 0.0004 = 20    →  20× above the clearly failing model (ECG)
+    har_flamingo provides an additional 7× headroom above the threshold.
+
+  The same value (0.008) is used for both min_mcspu_high_sigma and min_mcspu_range because
+  the calibration data for the range was consistent with the magnitude data across all three checkpoints.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FLAMINGO THRESHOLDS (summary)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    sensitivity_magnitude     > 0.008 nats   (SP: 0.05  — lower because Flamingo gates suppress absolute KL)
+    sensitivity_range         > 0.008 nats   (SP: 0.02  — same reason)
+    statistical_significance  < 0.05         (unchanged — architecture-neutral)
+    effect_size               > 0.30         (unchanged — architecture-neutral)
 
 
-================================================================
+===================================================================================================================================================================
 OVERALL PASS/FAIL LOGIC
-================================================================
+===================================================================================================================================================================
 
   SANITY tests:      all 4 must pass (broken = implementation bug).
   SENSITIVITY tests: all 4 must pass (failed = model ignores signal).
@@ -204,57 +329,69 @@ OVERALL PASS/FAIL LOGIC
   NOT PRODUCTION READY: any test failed              →  exit 1
 
 
-================================================================
+===================================================================================================================================================================
 OUTPUTS
-================================================================
+===================================================================================================================================================================
 
-Terminal:
-  - Colour-coded PASS/FAIL table (both test categories)
+GAUSSIAN MODE — Terminal output:
+  - Colour-coded PASS/FAIL table (sanity + sensitivity categories)
   - Threshold reference table with units
-  - Metric values for the model
-  - Overall verdict
+  - Metric values for the model under test
+  - Overall PRODUCTION READY / NOT PRODUCTION READY verdict
 
-Plots (saved to --out_dir as .png):
+GAUSSIAN MODE — Plots (saved to --out_dir as .png):
 
   mcspu_vs_sigma.png
-    Mean MCSPU ± 95% CI vs σ.
-    The key result figure: a signal-using model rises with σ,
-    a signal-ignoring model stays flat near zero.
+    Mean MCSPU ± 95% CI vs σ. A signal-using model rises with σ, a signal-ignoring model stays flat near zero.
 
   distributions.png
-    Violin plots of per-sample MCSPU at each σ.
-    Shows within-dataset variability, not just the mean.
+    Violin plots of per-sample MCSPU at each σ. Shows within-dataset variability, not just the mean.
 
   heatmap.png
     Colour-coded grid of mean MCSPU values (dataset × sigma).
-    Good summary for a paper or presentation.
 
   test_results.png
     Green/red heatmap of PASS/FAIL per test.
-    The definitive at-a-glance test summary.
 
   test_metrics.png
     Bar chart of each sensitivity metric with threshold lines.
-    Shows how far the model is from the acceptance boundary.
 
+MISSING DATA MODE — Terminal output:
+  - Summary table: missing fraction | mean MCSPU | std | n
+  - Explicit note that no thresholds apply
 
-================================================================
+MISSING DATA MODE — Plots (saved to --out_dir as .png):
+
+  mcspu_vs_fraction.png
+    Mean MCSPU ± 95% CI vs missing fraction. The primary robustness curve — should rise gradually.
+
+  distributions_missing.png
+    Violin plots of per-sample MCSPU at each missing fraction.
+
+  signal_example_missing.png
+    Side-by-side view of the original signal and the masked signal at each fraction level (channel 0,
+    sample 0). Visual reference for what the perturbation actually looks like in practice.
+
+===================================================================================================================================================================
 EXPERIMENTAL PARAMETERS
-================================================================
+===================================================================================================================================================================
 
-  n_noise     = 50   noise draws per sample
-                     Justification: gives SE = σ/√50 ≈ 0.14σ on the
-                     MCSPU estimate, sufficient for a reliable per-sample
-                     score. Other values I tried before, like N=20 gave
-                     SE≈0.22σ, too noisy for stable distributions.
+  n_noise = 50   perturbation draws per sample  (applies to both Gaussian and missing modes)
+                 This value gives SE = σ/√50 ≈ 0.14σ on the MCSPU estimate, sufficient for a reliable per-sample score.
+                 Other values I tried before, like N=20 gave SE≈0.22σ, too noisy for stable distributions.
 
-  max_samples = 200  test samples evaluated per sigma
-                     Justification: detects Cohen's d=0.3 with >95%
-                     power; all observed effects are d>1.9, giving
-                     essentially perfect statistical power.
+  max_samples = 200  test samples evaluated per parameter value  (applies to both modes)
+                     This value detects Cohen's d=0.3 with >95% power; all observed Gaussian effects are d>1.9.
+                     For missing data there are no formal power requirements since there are no thresholds,
+                     but 200 samples gives stable mean estimates (SE < 5% of mean for all observed datasets).
 
-  sigmas      = [0.1, 0.5, 1.0, 2.0]
+  sigmas = [0.1, 0.5, 1.0, 2.0]  (Gaussian mode)
                      Four points spanning small to large perturbation.
 
-  class_batch = 8    max answer candidates per GPU forward pass
-                     (Change accordingly to individual compute)
+  missing_fractions = [0.1, 0.25, 0.5, 0.75, 1.0]  (missing mode)
+                     Five points from light masking (10%) to complete signal erasure (100%).
+                     fraction=1.0 is a useful sanity check: MCSPU should be at least as high as at fraction=0.75,
+                     since zeroing all timepoints is strictly more disruptive than zeroing 75%.
+
+  class_batch = 16    max answer candidates per GPU forward pass  (applies to both modes)
+                     (change accordingly depending on individual compute; reduce to 8 for ECG-QA if OOM)

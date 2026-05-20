@@ -26,3 +26,6 @@ models/
 .claude/
 
 venv/
+
+ignore/
+CLAUDE.md
